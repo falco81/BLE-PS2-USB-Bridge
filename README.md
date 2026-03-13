@@ -77,7 +77,7 @@ The module has two sides:
 
 ### Wiring Diagram
 
-![Wiring diagram](wiring_diagram.svg)
+![Wiring diagram](doc/wiring_diagram.svg)
 
 #### Step-by-step connections
 
@@ -501,19 +501,3 @@ void loop() {
 
 ---
 
-## Soubory v repozitáři
-
-```
-├── ble_ps2_bridge.ino          # Varianta 1 — ESP32-WROOM-32 → PS/2 AT
-├── ble_usb_bridge_s3/
-│   └── ble_usb_bridge_s3.ino  # Varianta 2 — ESP32-S3 → USB HID
-├── BT_Scanner.ino              # BLE skener pro hledání MAC adresy
-├── README.md
-├── block_diagram.svg
-├── block_diagram_s3.svg
-├── wiring_diagram.svg
-├── din5_male.png
-├── minidins6_male.png
-├── level_shifter.png
-└── esp32s3_module.png
-```
