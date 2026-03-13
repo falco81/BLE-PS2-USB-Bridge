@@ -1,18 +1,18 @@
 /*
- * BLE Úplný skener — všechny dostupné informace
+ * BLE Full Scanner — all available device information
  * ESP32-WROOM-32 | NimBLE-Arduino 2.x | Arduino IDE 2.x
  *
- * NASTAVENÍ ARDUINO IDE:
+ * ARDUINO IDE SETTINGS:
  *   Board:  ESP32 Dev Module
- *   Port:   COM port ESP32
+ *   Port:   COM port of ESP32
  */
 
 #include <NimBLEDevice.h>
 
-// Jak dlouho trvá jeden sken (sekundy)
+// Duration of one scan (seconds)
 #define SCAN_DURATION_SEC  8
 
-// Pauza mezi skeny (sekundy)
+// Pause between scans (seconds)
 #define SCAN_PAUSE_SEC     15
 
 // ============================================================
@@ -20,30 +20,30 @@
 static BLEUUID HID_SERVICE_UUID("00001812-0000-1000-8000-00805f9b34fb");
 int scanCount = 0;
 
-// Převod typu adresy na string
+// Convert address type to string
 const char* addrTypeStr(uint8_t type) {
   switch (type) {
     case BLE_ADDR_PUBLIC:    return "Public";
     case BLE_ADDR_RANDOM:    return "Random";
     case BLE_ADDR_PUBLIC_ID: return "Public ID";
     case BLE_ADDR_RANDOM_ID: return "Random ID";
-    default:                 return "Neznámý";
+    default:                 return "Unknown";
   }
 }
 
-// Převod appearance hodnoty na čitelný popis
+// Convert appearance value to readable description
 const char* appearanceStr(uint16_t a) {
   switch (a) {
-    case 0x0000: return "Neurčeno";
-    case 0x0180: return "Obecné HID";
-    case 0x0181: return "Klávesnice";
-    case 0x0182: return "Myš";
+    case 0x0000: return "Unknown";
+    case 0x0180: return "Generic HID";
+    case 0x0181: return "Keyboard";
+    case 0x0182: return "Mouse";
     case 0x0183: return "Joystick";
     case 0x0184: return "Gamepad";
-    case 0x03C0: return "Hodinky";
-    case 0x0041: return "Sluchátka";
-    case 0x0042: return "Hlasitý odposlech";
-    case 0x0044: return "Reproduktor";
+    case 0x03C0: return "Watch";
+    case 0x0041: return "Headphones";
+    case 0x0042: return "Hands-free";
+    case 0x0044: return "Speaker";
     default: {
       static char buf[16];
       snprintf(buf, sizeof(buf), "0x%04X", a);
@@ -52,10 +52,10 @@ const char* appearanceStr(uint16_t a) {
   }
 }
 
-// Pojmenuj UUID service — NimBLE 2.x: UUID16 přečteme přes toString() + strtoul
+// Name a service UUID — NimBLE 2.x: read UUID16 via toString() + strtoul
 const char* serviceNameStr(const NimBLEUUID& uuid) {
   if (uuid.bitSize() != 16) return "";
-  // toString() pro 16-bit UUID vrací "xxxx" (4 hex znaky)
+  // toString() for 16-bit UUID returns "xxxx" (4 hex chars)
   uint16_t uuid16 = (uint16_t)strtoul(uuid.toString().c_str(), nullptr, 16);
   switch (uuid16) {
     case 0x1800: return " (Generic Access)";
@@ -71,7 +71,7 @@ const char* serviceNameStr(const NimBLEUUID& uuid) {
   }
 }
 
-// Vypiš všechny UUID services
+// Print all service UUIDs
 void printServices(const NimBLEAdvertisedDevice* dev) {
   if (dev->haveServiceUUID()) {
     Serial.printf("      Services (%d):\n", dev->getServiceUUIDCount());
@@ -83,11 +83,11 @@ void printServices(const NimBLEAdvertisedDevice* dev) {
                     serviceNameStr(uuid));
     }
   } else {
-    Serial.println("      Services: (žádné v advertisementu)");
+    Serial.println("      Services: (none in advertisement)");
   }
 }
 
-// Vypiš Service Data
+// Print Service Data
 void printServiceData(const NimBLEAdvertisedDevice* dev) {
   if (dev->haveServiceData()) {
     Serial.printf("      Service Data (%d):\n", dev->getServiceDataCount());
@@ -104,7 +104,7 @@ void printServiceData(const NimBLEAdvertisedDevice* dev) {
   }
 }
 
-// Vypiš Manufacturer Data
+// Print Manufacturer Data
 void printManufacturerData(const NimBLEAdvertisedDevice* dev) {
   if (dev->haveManufacturerData()) {
     std::string mfr = dev->getManufacturerData();
@@ -112,7 +112,7 @@ void printManufacturerData(const NimBLEAdvertisedDevice* dev) {
     for (size_t i = 0; i < mfr.size(); i++) {
       Serial.printf("%02X ", (uint8_t)mfr[i]);
     }
-    // První dva bajty jsou Company ID (little-endian)
+    // First two bytes are Company ID (little-endian)
     if (mfr.size() >= 2) {
       uint16_t companyId = ((uint8_t)mfr[1] << 8) | (uint8_t)mfr[0];
       Serial.printf("\n      Company ID: 0x%04X", companyId);
@@ -131,28 +131,28 @@ void printManufacturerData(const NimBLEAdvertisedDevice* dev) {
   }
 }
 
-// Hlavní funkce výpisu jednoho zařízení
+// Main function — print one device
 void printDevice(int index, const NimBLEAdvertisedDevice* dev) {
   bool isHID = dev->haveServiceUUID() &&
                dev->isAdvertisingService(HID_SERVICE_UUID);
 
   Serial.println("  ----------------------------------------");
-  Serial.printf("  Zařízení #%d %s\n", index,
-                isHID ? "*** BLE HID KLÁVESNICE ***" : "");
+  Serial.printf("  Device #%d %s\n", index,
+                isHID ? "*** BLE HID KEYBOARD ***" : "");
   Serial.println("  ----------------------------------------");
 
-  // Základní identifikace
-  Serial.printf("      MAC adresa:   %s\n",
+  // Basic identification
+  Serial.printf("      MAC address:  %s\n",
                 dev->getAddress().toString().c_str());
-  Serial.printf("      Typ adresy:   %s\n",
+  Serial.printf("      Address type: %s\n",
                 addrTypeStr(dev->getAddress().getType()));
   Serial.printf("      RSSI:         %d dBm\n", dev->getRSSI());
 
-  // Název
+  // Name
   if (dev->haveName()) {
-    Serial.printf("      Název:        %s\n", dev->getName().c_str());
+    Serial.printf("      Name:         %s\n", dev->getName().c_str());
   } else {
-    Serial.println("      Název:        (neuvedeno)");
+    Serial.println("      Name:         (not provided)");
   }
 
   // Appearance
@@ -166,8 +166,8 @@ void printDevice(int index, const NimBLEAdvertisedDevice* dev) {
     Serial.printf("      TX Power:     %d dBm\n", dev->getTXPower());
   }
 
-  // Typ advertisementu — opravená konstanta pro NimBLE 2.x
-  Serial.print("      Adv. typ:     ");
+  // Advertisement type — corrected constant for NimBLE 2.x
+  Serial.print("      Adv. type:    ");
   switch (dev->getAdvType()) {
     case BLE_HCI_ADV_TYPE_ADV_IND:
       Serial.println("ADV_IND (connectable, scannable)"); break;
@@ -177,15 +177,15 @@ void printDevice(int index, const NimBLEAdvertisedDevice* dev) {
       Serial.println("ADV_SCAN_IND (scannable, non-connectable)"); break;
     case BLE_HCI_ADV_TYPE_ADV_NONCONN_IND:
       Serial.println("ADV_NONCONN_IND (non-connectable)"); break;
-    case BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP:   // ← opravená konstanta
+    case BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP:   // corrected constant
       Serial.println("SCAN_RSP (scan response)"); break;
     default:
       Serial.printf("0x%02X\n", dev->getAdvType()); break;
   }
 
   // Connectable
-  Serial.printf("      Připojitelné: %s\n",
-                dev->isConnectable() ? "ANO" : "NE");
+  Serial.printf("      Connectable:  %s\n",
+                dev->isConnectable() ? "YES" : "NO");
 
   // Services
   printServices(dev);
@@ -209,7 +209,7 @@ void printDevice(int index, const NimBLEAdvertisedDevice* dev) {
 void doScan() {
   scanCount++;
   Serial.println("\n========================================");
-  Serial.printf(" Sken #%d (trvání %ds)\n", scanCount, SCAN_DURATION_SEC);
+  Serial.printf(" Scan #%d (duration %ds)\n", scanCount, SCAN_DURATION_SEC);
   Serial.println("========================================\n");
 
   NimBLEScan* scan = NimBLEDevice::getScan();
@@ -220,7 +220,7 @@ void doScan() {
   int total    = results.getCount();
   int hidCount = 0;
 
-  Serial.printf("Nalezeno %d BLE zařízení:\n\n", total);
+  Serial.printf("Found %d BLE devices:\n\n", total);
 
   for (int i = 0; i < total; i++) {
     const NimBLEAdvertisedDevice* dev = results.getDevice(i);
@@ -232,9 +232,8 @@ void doScan() {
   }
 
   Serial.println("========================================");
-  Serial.printf(" Souhrn: celkem %d zařízení, z toho %d HID\n",
-                total, hidCount);
-  Serial.printf(" Další sken za %d sekund...\n", SCAN_PAUSE_SEC);
+  Serial.printf(" Summary: %d devices total, %d HID\n", total, hidCount);
+  Serial.printf(" Next scan in %d seconds...\n", SCAN_PAUSE_SEC);
   Serial.println("========================================\n");
 }
 
@@ -243,9 +242,9 @@ void setup() {
   delay(1000);
 
   Serial.println("================================");
-  Serial.println("  BLE Úplný skener");
+  Serial.println("  BLE Full Scanner");
   Serial.println("  ESP32-WROOM-32 | NimBLE 2.x");
-  Serial.printf ("  Sken každých %ds, trvání %ds\n",
+  Serial.printf ("  Scan every %ds, duration %ds\n",
                  SCAN_PAUSE_SEC, SCAN_DURATION_SEC);
   Serial.println("================================");
 
@@ -253,7 +252,7 @@ void setup() {
   NimBLEDevice::setPower(9);
 
   NimBLEScan* scan = NimBLEDevice::getScan();
-  scan->setActiveScan(true);  // active = dostane Scan Response (název, TX power)
+  scan->setActiveScan(true);  // active = receives Scan Response (name, TX power)
   scan->setInterval(100);
   scan->setWindow(60);
 

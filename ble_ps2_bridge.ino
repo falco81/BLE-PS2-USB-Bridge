@@ -531,24 +531,24 @@ void ps2kb_task_send(void *arg) {
  * BLE HID Host → PS/2 AT Keyboard Bridge  v1.6
  * ESP32-WROOM-32 | NimBLE-Arduino 2.x | Arduino IDE 2.x
  *
- * Zapojení (s level shifterem 3.3V↔5V):
+ * Wiring (with 3.3V↔5V level shifter):
  *   PS/2 CLK  ←→ level shifter ←→ GPIO19
  *   PS/2 DATA ←→ level shifter ←→ GPIO18
  *   PS/2 GND  ————————————————————— GND
  *   PS/2 +5V  ————————————————————— VIN
  *
- * Příkazy (Serial 115200):
+ * Serial commands (115200 baud):
  *   scan              Skenuj 10 sekund
- *   connect <mac>     Připoj (3 pokusy) a ulož
- *   forget            Smaž uloženou klávesnici
+ *   connect <mac>     Connect (3 attempts) and save
+ *   forget            Clear saved keyboard and bonds
  *   status            Zobraz stav
- *   help              Nápověda
+ *   help              Show help
  *
- * Změny v1.6:
- *   - PS/2 implementace přepsána podle referenčního projektu esp32-bt2ps2
- *     (ps2kb.h / ps2kb.cpp) — přímý port, zachovává FreeRTOS tasky,
- *     open-drain GPIO, taskENTER_CRITICAL, přesné timing konstanty
- *   - keyHid_send() nahrazuje vlastní scan code logiku
+ * Changes v1.6:
+ *   - PS/2 implementation rewritten based on reference project esp32-bt2ps2
+ *     (ps2kb.h / ps2kb.cpp) — direct port, preserves FreeRTOS tasks,
+ *     open-drain GPIO, taskENTER_CRITICAL, precise timing constants
+ *   - keyHid_send() replaces custom scan code logic
  */
 
 
@@ -561,7 +561,7 @@ void ps2kb_task_send(void *arg) {
 #define NVS_KEY_TYPE  "type"
 #define CONNECT_TRIES 3
 
-// ── Globální stav ─────────────────────────────────────────────────────────────
+// ── Global state ──────────────────────────────────────────────────────────────
 static PS2Keyboard    keyboard(PS2_CLK_PIN, PS2_DAT_PIN);
 
 static NimBLEClient*  pClient           = nullptr;
@@ -581,15 +581,15 @@ static BLEUUID HID_REPORT_UUID ("00002a4d-0000-1000-8000-00805f9b34fb");
 static unsigned long  scanEndAt = 0;
 static int            scanCount = 0;
 
-// ── Typematic (opakování klávesy při držení) ──────────────────────────────────
-// Stejná logika jako referenční projekt: 500ms zpoždění, pak 20 znaků/s
+// ── Typematic (key repeat while held) ────────────────────────────────────────
+// Same logic as reference project: 500 ms initial delay, then 20 keys/s
 #define TYPEMATIC_DELAY_MS  500
 #define TYPEMATIC_RATE_MS    50
 static unsigned long  typematicNext  = 0;
 static bool           typematicArmed = false;
 static uint8_t        typematicKey   = 0;
 
-// ── Jméno klávesy pro debug ───────────────────────────────────────────────────
+// ── Key name helper for debug output ─────────────────────────────────────────
 const char* hidKeyName(uint8_t k) {
   if (k >= 0x04 && k <= 0x1D) {
     static char b[3]; b[0] = 'A' + (k - 0x04); b[1] = 0; return b;
@@ -626,8 +626,8 @@ const char* modName(int bit) {
 
 // ── HID report → PS/2 ────────────────────────────────────────────────────────
 //
-// keyboard.keyHid_send() přijímá HID keykódy 0x04–0xE7
-// Modifier bity mapujeme na 0xE0–0xE7 (stejné schéma jako referenční projekt)
+// keyboard.keyHid_send() accepts HID keycodes 0x04–0xE7
+// Modifier bits mapped to 0xE0–0xE7 (same scheme as reference project)
 
 void processHIDReport(uint8_t* data, size_t len) {
   if (len < 3) return;
@@ -638,7 +638,7 @@ void processHIDReport(uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
   Serial.println();
 
-  // Modifier klávesy (bity 0–7 → HID 0xE0–0xE7)
+  // Modifier keys (bits 0–7 → HID 0xE0–0xE7)
   for (int bit = 0; bit < 8; bit++) {
     uint8_t mask = 1 << bit;
     bool wasDown = (prevMod & mask) != 0;
@@ -652,7 +652,7 @@ void processHIDReport(uint8_t* data, size_t len) {
     }
   }
 
-  // Uvolněné klávesy
+  // Released keys
   for (int i = 0; i < 6; i++) {
     if (prevKeys[i] == 0 || prevKeys[i] == 0x01) continue;
     bool found = false;
@@ -663,7 +663,7 @@ void processHIDReport(uint8_t* data, size_t len) {
     }
   }
 
-  // Stisknuté klávesy
+  // Pressed keys
   for (int i = 0; i < 6; i++) {
     if (keys[i] == 0 || keys[i] == 0x01) continue;
     bool found = false;
@@ -677,7 +677,7 @@ void processHIDReport(uint8_t* data, size_t len) {
   prevMod = mod;
   memcpy(prevKeys, keys, 6);
 
-  // Typematic: najdi první drženou non-modifier klávesu (ne CapsLock 0x39)
+  // Typematic: find first held non-modifier key (skip CapsLock 0x39)
   typematicKey = 0;
   for (int i = 0; i < 6; i++) {
     if (keys[i] && keys[i] != 0x01 && keys[i] != 0x39) {
@@ -686,7 +686,7 @@ void processHIDReport(uint8_t* data, size_t len) {
     }
   }
   if (typematicKey) {
-    typematicArmed = false;           // reset — čekáme na první zpoždění
+    typematicArmed = false;           // reset — wait for initial delay
     typematicNext  = millis() + TYPEMATIC_DELAY_MS;
   } else {
     typematicArmed = false;
@@ -710,7 +710,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
   void onScanEnd(const NimBLEScanResults& r, int reason) override {}
 };
 
-// ── BLE připojení ─────────────────────────────────────────────────────────────
+// ── BLE connection ────────────────────────────────────────────────────────────
 bool tryConnect(NimBLEAddress addr) {
   if (pClient) {
     if (pClient->isConnected()) pClient->disconnect();
@@ -758,7 +758,7 @@ bool tryConnect(NimBLEAddress addr) {
 
 bool connectWithRetry(NimBLEAddress addr, int tries) {
   for (int i = 1; i <= tries; i++) {
-    Serial.printf("[BLE] Pokus %d/%d: %s\n", i, tries, addr.toString().c_str());
+    Serial.printf("[BLE] Attempt %d/%d: %s\n", i, tries, addr.toString().c_str());
     if (tryConnect(addr)) return true;
     Serial.println("[BLE] Selhalo.");
     if (i < tries) delay(1500);
@@ -802,7 +802,7 @@ void forgetKeyboard() {
   Serial.println("[FORGET] Smazano. Pouzij: scan  pak  connect <mac>");
 }
 
-// ── Sériové příkazy ──────────────────────────────────────────────────────────
+// ── Serial console commands ───────────────────────────────────────────────────
 void printHelp() {
   Serial.println("\nPrikazy:");
   Serial.println("  scan              Skenuj BLE 10s");
@@ -840,7 +840,7 @@ void cmdStatus() {
   bool conn = pClient && pClient->isConnected();
   Serial.printf("\nStav:   %s\nMAC:    %s\nBondy:  %d\n",
     conn ? "PRIPOJENO" : "NEPRIPOJENO",
-    strlen(savedMAC) ? savedMAC : "(zadna)",
+    strlen(savedMAC) ? savedMAC : "(none)",
     NimBLEDevice::getNumBonds());
   if (conn) Serial.printf("Peer:   %s\n", pClient->getPeerAddress().toString().c_str());
   if (!conn && reconnectAt) Serial.printf("Reconn: za %ldms\n", (long)(reconnectAt - millis()));
@@ -862,26 +862,26 @@ void handleSerial() {
 }
 
 // ── BLE daemon task ──────────────────────────────────────────────────────────
-// Stejný přístup jako referenční projekt: dedikovaný task který periodicky
-// kontroluje připojení a spustí reconnect pokud je klávesnice ztracena.
-// Běží nezávisle na loop() — reaguje i když loop() blokuje na BLE operaci.
+// Same approach as reference project: dedicated task that periodically
+// checks the connection and triggers reconnect if the keyboard is lost.
+// Runs independently of loop() — reacts even when loop() blocks on BLE.
 
 void bleDaemonTask(void* arg) {
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(3000)); // kontrola každé 3s
+    vTaskDelay(pdMS_TO_TICKS(3000)); // check every 3 s
 
-    if (strlen(savedMAC) == 0) continue;                     // žádná uložená klávesnice
-    if (pClient && pClient->isConnected()) continue;          // vše OK
-    if (reconnectAt != 0) continue;                           // reconnect už naplánován loop()
+    if (strlen(savedMAC) == 0) continue;                     // no saved keyboard
+    if (pClient && pClient->isConnected()) continue;          // all good
+    if (reconnectAt != 0) continue;                           // reconnect already scheduled
 
-    // Klávesnice ztracena a loop() to ještě nezachytil — naplánuj reconnect
-    Serial.println("[DAEMON] Klavesnice ztracena, planuji reconnect...");
+    // Keyboard lost and loop() hasn't caught it yet — schedule reconnect
+    Serial.println("[DAEMON] Keyboard lost, scheduling reconnect...");
     memset(prevKeys, 0, 6);
     prevMod        = 0;
     typematicKey   = 0;
     typematicArmed = false;
     typematicNext  = 0;
-    reconnectAt    = millis() + 500; // rychlý reconnect — daemon to zjistil jako první
+    reconnectAt    = millis() + 500; // fast reconnect — daemon detected it first
   }
 }
 
@@ -895,7 +895,7 @@ void setup() {
   Serial.printf ("  CLK=GPIO%d  DAT=GPIO%d\n", PS2_CLK_PIN, PS2_DAT_PIN);
   Serial.println("================================");
 
-  // keyboard.begin() nastaví GPIO, pošle BAT 0xAA, spustí FreeRTOS tasky
+  // keyboard.begin() configures GPIO, sends BAT 0xAA, starts FreeRTOS tasks
   keyboard.begin();
 
   // BLE
@@ -905,15 +905,15 @@ void setup() {
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   NimBLEDevice::getScan()->setScanCallbacks(new MyScanCallbacks(), false);
 
-  // BLE daemon task — sleduje připojení nezávisle na loop()
+  // BLE daemon task — monitors connection independently of loop()
   xTaskCreatePinnedToCore(bleDaemonTask, "ble_daemon", 4096, nullptr, 1, nullptr, 0);
 
   if (loadSavedKeyboard()) {
-    Serial.printf("[NVS] Ulozena klavesnice: %s\n", savedMAC);
+    Serial.printf("[NVS] Saved keyboard: %s\n", savedMAC);
     reconnectAt = millis() + 500;
   } else {
-    Serial.println("[NVS] Zadna ulozena klavesnice.");
-    Serial.println("      Pouzij 'scan' a pak 'connect <mac>'.");
+    Serial.println("[NVS] No saved keyboard.");
+    Serial.println("      Use 'scan' then 'connect <mac>'.");
   }
   printHelp();
 }
@@ -927,14 +927,14 @@ void loop() {
     scanEndAt = 0;
     NimBLEDevice::getScan()->stop();
     if (scanCount == 0)
-      Serial.println("[SCAN] Zadne zarizeni. Zkus znovu.");
+      Serial.println("[SCAN] No devices found. Try again.");
     else
-      Serial.printf("[SCAN] Hotovo — %d zarizeni. Pouzij: connect <mac>\n", scanCount);
+      Serial.printf("[SCAN] Done — %d devices. Use: connect <mac>\n", scanCount);
   }
 
-  // Detekce odpojení
+  // Disconnection detection
   if (pClient && !pClient->isConnected() && strlen(savedMAC) > 0 && reconnectAt == 0) {
-    Serial.println("[BLE] Klavesnice odpojena.");
+    Serial.println("[BLE] Keyboard disconnected.");
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
     memset(prevKeys, 0, 6); prevMod = 0;
     reconnectFailures = 0;
@@ -951,16 +951,16 @@ void loop() {
         reconnectFailures = 0;
       } else {
         reconnectFailures++;
-        Serial.printf("[BLE] Reconnect selhal (%dx). Dalsi pokus za 2s\n", reconnectFailures);
+        Serial.printf("[BLE] Reconnect failed (%dx). Retrying in 2s\n", reconnectFailures);
         reconnectAt = millis() + 2000;
       }
     }
   }
 
-  // Typematic opakování
+  // Typematic repeat
   if (typematicKey && typematicNext && millis() >= typematicNext) {
     if (!typematicArmed) {
-      // První opakování po TYPEMATIC_DELAY_MS — přepni na rychlý interval
+      // First repeat after TYPEMATIC_DELAY_MS — switch to fast interval
       typematicArmed = true;
       typematicNext  = millis() + TYPEMATIC_RATE_MS;
     } else {

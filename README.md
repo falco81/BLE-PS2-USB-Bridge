@@ -240,9 +240,9 @@ MIT
 
 ---
 
-# Varianta 2 — BLE → USB HID (ESP32-S3 N16R8)
+# Variant 2 — BLE → USB HID (ESP32-S3 N16R8)
 
-BLE klávesnice → **USB HID klávesnice** pomocí nativního USB rozhraní ESP32-S3. Žádný level shifter, žádný PS/2 kabel — stačí jediný USB-C kabel který zároveň napájí modul i přenáší HID zprávy.
+BLE keyboard → **USB HID keyboard** using the native USB interface of the ESP32-S3. No level shifter, no PS/2 cable — a single USB-C cable both powers the module and carries HID data.
 
 ## Hardware
 
@@ -250,25 +250,25 @@ BLE klávesnice → **USB HID klávesnice** pomocí nativního USB rozhraní ESP
 
 <img src="doc/esp32s3_module.png" width="320" alt="ESP32-S3 N16R8 development module"/>
 
-| Parametr | Hodnota |
+| Parameter | Value |
 |----------|---------|
 | SoC | ESP32-S3 |
 | Flash | 16 MB |
 | PSRAM | 8 MB (Octal) |
 | BLE | 5.0 (NimBLE) |
 | WiFi | 802.11 b/g/n |
-| USB | Native USB OTG (bez CH340) |
-| Rozměr | 51 × 25 mm |
+| USB | Native USB OTG (no CH340) |
+| Dimensions | 51 × 25 mm |
 
-> ESP32-S3 má **nativní USB** přímo na čipu — může se prezentovat jako USB HID zařízení bez jakéhokoliv převodníku. BLE HID keykódy (Usage Page 0x07) jsou identické s USB HID keykódy, takže přeposílání je přímé bez tabulek.
+> The ESP32-S3 has **native USB** built into the chip — it can present itself as a USB HID device without any converter. BLE HID keycodes (Usage Page 0x07) are identical to USB HID keycodes, so forwarding is direct with no translation table.
 
-### Zapojení
+### Wiring
 
 ```
 BLE Keyboard  ──(BLE 5.0)──►  ESP32-S3  ──(USB-C)──►  PC
 ```
 
-**Žádné extra součástky.** Jeden USB-C kabel zajistí napájení modulu i HID výstup do PC.
+**No extra components.** A single USB-C cable provides both power and HID output to the PC.
 
 ## Block Diagram
 
@@ -276,122 +276,122 @@ BLE Keyboard  ──(BLE 5.0)──►  ESP32-S3  ──(USB-C)──►  PC
 
 ## Software — `ble_usb_bridge_s3.ino`
 
-### Nastavení Arduino IDE
+### Arduino IDE Settings
 
-| Položka | Hodnota |
+| Setting | Value |
 |---------|---------|
 | Board | **ESP32S3 Dev Module** |
-| USB Mode | **USB-OTG (TinyUSB)** ← nutné! |
+| USB Mode | **USB-OTG (TinyUSB)** ← required! |
 | USB CDC On Boot | Disabled |
 | Flash Size | 16MB |
 | PSRAM | OPI PSRAM |
 | Upload Mode | UART0 / USB-CDC |
 
-> ⚠️ **USB Mode musí být `USB-OTG (TinyUSB)`** — bez toho USB HID nefunguje. Nastavení je v menu `Tools` v Arduino IDE.
+> ⚠️ **USB Mode must be set to `USB-OTG (TinyUSB)`** — without this USB HID will not work. Set it in the `Tools` menu in Arduino IDE.
 
-### Požadované knihovny
+### Required Libraries
 
-| Knihovna | Zdroj |
+| Library | Source |
 |----------|-------|
 | NimBLE-Arduino 2.x | Library Manager |
-| USB.h + USBHIDKeyboard.h | součást ESP32 Arduino core 3.x |
+| USB.h + USBHIDKeyboard.h | included in ESP32 Arduino core 3.x |
 
-### Jak to funguje
+### How It Works
 
 ```
-notifyCallback()          ← BLE HID notify ze klávesnice
+notifyCallback()          ← BLE HID notify from keyboard
   └─ processHIDReport()
        ├─ usbApplyModifiers(mod)   → hidKb.releaseModifier() + pressModifier()
        ├─ usbKeyUp(keycode)        → hidKb.releaseRaw(keycode)
        └─ usbKeyDown(keycode)      → hidKb.pressRaw(keycode)
 
 loop()
-  └─ Typematic: hidKb.pressRaw(typematicKey) každých 50 ms po 500 ms držení
+  └─ Typematic: hidKb.pressRaw(typematicKey) every 50 ms after 500 ms hold
 
 bleDaemonTask (FreeRTOS, core 0)
-  └─ kontrola každé 3 s → hidKb.releaseAll() + reconnect
+  └─ check every 3 s → hidKb.releaseAll() + reconnect
 ```
 
-Protože BLE HID Usage Table (Keyboard/Keypad, Usage Page 0x07) je identická s USB HID, keykódy se přeposílají přímo bez převodní tabulky.
+Since the BLE HID Usage Table (Keyboard/Keypad, Usage Page 0x07) is identical to USB HID, keycodes are forwarded directly without a translation table.
 
-### Rozdíly oproti PS/2 variantě
+### Comparison with PS/2 Variant
 
-| | Varianta 1 (PS/2) | Varianta 2 (USB) |
+| | Variant 1 (PS/2) | Variant 2 (USB) |
 |--|------------------|-----------------|
 | Hardware | ESP32-WROOM-32 + level shifter | ESP32-S3 |
-| Výstup | AT DIN-5 / PS/2 | USB-C HID |
-| Extra součástky | Level shifter BSS138 | Žádné |
-| Napájení | 5V z PS/2 nebo USB | USB-C kabel |
-| Kompatibilita | Retro PC, průmyslové | Moderní PC, Mac, Linux |
+| Output | AT DIN-5 / PS/2 | USB-C HID |
+| Extra components | BSS138 level shifter | None |
+| Power | 5V from PS/2 or USB | USB-C cable |
+| Compatibility | Retro PC, industrial | Modern PC, Mac, Linux |
 | BIOS POST | ✅ (BAT 0xAA, GET_DEVICE_ID) | ✅ (USB enumeration) |
-| Scan codes | PS/2 Set 2 | USB HID Usage |
-| Driver | Žádný (PS/2 nativní) | Žádný (HID plug & play) |
+| Key codes | PS/2 Set 2 | USB HID Usage |
+| Driver | None (PS/2 native) | None (HID plug & play) |
 
-### Serial konzole
+### Serial Console
 
-Debug výstup jde přes **UART0** (USB-C port nebo UART piny TX0/RX0) — nezávisle na USB HID portu.
-Příkazy jsou stejné jako u PS/2 varianty: `scan` / `connect <mac>` / `forget` / `status` / `help`.
+Debug output goes through **UART0** (USB-C port or UART pins TX0/RX0) — independent of the USB HID port.
+Commands are the same as in the PS/2 variant: `scan` / `connect <mac>` / `forget` / `status` / `help`.
 
-### Konfigurace
+### Configuration
 
 ```cpp
-#define TYPEMATIC_DELAY_MS   500   // ms před začátkem opakování
-#define TYPEMATIC_RATE_MS     50   // ms mezi opakováními (20 kl/s)
+#define TYPEMATIC_DELAY_MS   500   // ms before repeat starts
+#define TYPEMATIC_RATE_MS     50   // ms between repeats (20 keys/s)
 ```
 
 ---
 
 ---
 
-# Nástroje — BT Scanner
+# Tools — BT Scanner
 
-`BT_Scanner.ino` slouží k průzkumu okolních BLE zařízení. Použij ho k nalezení MAC adresy klávesnice před jejím párováním.
+`BT_Scanner.ino` scans nearby BLE devices. Use it to find the MAC address of your keyboard before pairing.
 
-## Použití
+## Usage
 
-1. Nahraj `BT_Scanner.ino` na ESP32 (WROOM nebo S3)
-2. Otevři Serial Monitor na **115200 baud**
-3. Skener automaticky spustí sken každých 15 sekund
+1. Upload `BT_Scanner.ino` to ESP32 (WROOM or S3)
+2. Open Serial Monitor at **115200 baud**
+3. The scanner runs automatically, repeating every 15 seconds
 
 ```
 ========================================
- Sken #1 (trvání 8s)
+ Scan #1 (duration 8s)
 ========================================
 
-Nalezeno 3 BLE zařízení:
+Found 3 BLE devices:
 
   ----------------------------------------
-  Zařízení #2 *** BLE HID KLÁVESNICE ***
+  Device #2 *** BLE HID KEYBOARD ***
   ----------------------------------------
-      MAC adresa:   aa:bb:cc:dd:ee:ff
-      Typ adresy:   Random
+      MAC address:  aa:bb:cc:dd:ee:ff
+      Address type: Random
       RSSI:         -61 dBm
-      Název:        MyKeyboard
-      Appearance:   Klávesnice
+      Name:         MyKeyboard
+      Appearance:   Keyboard
       Services (1):
         [0] 1812 (HID - Human Interface Device)
-      Připojitelné: ANO
+      Connectable:  YES
 ```
 
-Zařízení označená `*** BLE HID KLÁVESNICE ***` mají aktivní HID service (UUID 0x1812). MAC adresu z výpisu použij v příkazu `connect`.
+Devices marked `*** BLE HID KEYBOARD ***` advertise an active HID service (UUID 0x1812). Use the MAC address from the output in the `connect` command.
 
-## Nastavení
+## Settings
 
 ```cpp
-#define SCAN_DURATION_SEC  8    // délka jednoho skenu
-#define SCAN_PAUSE_SEC    15    // pauza mezi skeny
+#define SCAN_DURATION_SEC  8    // duration of one scan
+#define SCAN_PAUSE_SEC    15    // pause between scans
 ```
 
 ## `BT_Scanner.ino`
 
 ```cpp
 /*
- * BLE Úplný skener — všechny dostupné informace
+ * BLE Full Scanner — all available device information
  * ESP32-WROOM-32 | NimBLE-Arduino 2.x | Arduino IDE 2.x
  *
- * NASTAVENÍ ARDUINO IDE:
+ * ARDUINO IDE SETTINGS:
  *   Board:  ESP32 Dev Module
- *   Port:   COM port ESP32
+ *   Port:   COM port of ESP32
  */
 
 #include <NimBLEDevice.h>
@@ -408,15 +408,15 @@ const char* addrTypeStr(uint8_t type) {
     case BLE_ADDR_RANDOM:    return "Random";
     case BLE_ADDR_PUBLIC_ID: return "Public ID";
     case BLE_ADDR_RANDOM_ID: return "Random ID";
-    default:                 return "Neznámý";
+    default:                 return "Unknown";
   }
 }
 
 const char* appearanceStr(uint16_t a) {
   switch (a) {
-    case 0x0180: return "Obecné HID";
-    case 0x0181: return "Klávesnice";
-    case 0x0182: return "Myš";
+    case 0x0180: return "Generic HID";
+    case 0x0181: return "Keyboard";
+    case 0x0182: return "Mouse";
     default: { static char buf[16]; snprintf(buf,sizeof(buf),"0x%04X",a); return buf; }
   }
 }
@@ -437,14 +437,14 @@ void printDevice(int index, const NimBLEAdvertisedDevice* dev) {
   bool isHID = dev->haveServiceUUID() &&
                dev->isAdvertisingService(HID_SERVICE_UUID);
   Serial.println("  ----------------------------------------");
-  Serial.printf("  Zařízení #%d %s\n", index,
-                isHID ? "*** BLE HID KLÁVESNICE ***" : "");
+  Serial.printf("  Device #%d %s\n", index,
+                isHID ? "*** BLE HID KEYBOARD ***" : "");
   Serial.println("  ----------------------------------------");
-  Serial.printf("      MAC adresa:   %s\n", dev->getAddress().toString().c_str());
-  Serial.printf("      Typ adresy:   %s\n", addrTypeStr(dev->getAddress().getType()));
+  Serial.printf("      MAC address:  %s\n", dev->getAddress().toString().c_str());
+  Serial.printf("      Address type: %s\n", addrTypeStr(dev->getAddress().getType()));
   Serial.printf("      RSSI:         %d dBm\n", dev->getRSSI());
   if (dev->haveName())
-    Serial.printf("      Název:        %s\n", dev->getName().c_str());
+    Serial.printf("      Name:         %s\n", dev->getName().c_str());
   if (dev->haveAppearance())
     Serial.printf("      Appearance:   %s\n", appearanceStr(dev->getAppearance()));
   if (dev->haveServiceUUID()) {
@@ -455,20 +455,20 @@ void printDevice(int index, const NimBLEAdvertisedDevice* dev) {
                     uuid.toString().c_str(), serviceNameStr(uuid));
     }
   }
-  Serial.printf("      Připojitelné: %s\n", dev->isConnectable() ? "ANO" : "NE");
+  Serial.printf("      Connectable:  %s\n", dev->isConnectable() ? "ANO" : "NE");
   Serial.println();
 }
 
 void doScan() {
   scanCount++;
   Serial.printf("\n========================================\n");
-  Serial.printf(" Sken #%d (trvání %ds)\n", scanCount, SCAN_DURATION_SEC);
+  Serial.printf(" Scan #%d (duration %ds)\n", scanCount, SCAN_DURATION_SEC);
   Serial.printf("========================================\n\n");
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->clearResults();
   NimBLEScanResults results = scan->getResults(SCAN_DURATION_SEC * 1000, false);
   int total = results.getCount(), hidCount = 0;
-  Serial.printf("Nalezeno %d BLE zařízení:\n\n", total);
+  Serial.printf("Found %d BLE devices:\n\n", total);
   for (int i = 0; i < total; i++) {
     const NimBLEAdvertisedDevice* dev = results.getDevice(i);
     printDevice(i + 1, dev);
@@ -476,8 +476,8 @@ void doScan() {
       hidCount++;
   }
   Serial.printf("========================================\n");
-  Serial.printf(" Souhrn: %d zařízení, %d HID\n", total, hidCount);
-  Serial.printf(" Další sken za %ds...\n", SCAN_PAUSE_SEC);
+  Serial.printf(" Summary: %d devices total, %d HID\n", total, hidCount);
+  Serial.printf(" Next scan in %ds...\n", SCAN_PAUSE_SEC);
   Serial.printf("========================================\n\n");
 }
 
