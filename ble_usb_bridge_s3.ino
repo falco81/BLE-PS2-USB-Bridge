@@ -80,10 +80,17 @@ static uint8_t           typematicMod   = 0;   // modifiers at time of hold
 //   bit 4 = RCtrl  bit 5 = RShift  bit 6 = RAlt  bit 7 = RGUI
 
 void usbApplyModifiers(uint8_t mod) {
-  // Release all modifiers then apply current state
-  // USBHIDKeyboard::pressModifier() / releaseModifier() operate on a bitmask
-  hidKb.releaseModifier(0xFF);   // release all
-  if (mod) hidKb.pressModifier(mod);
+  // USBHIDKeyboard has no pressModifier/releaseModifier.
+  // Modifier keycodes are 0xE0–0xE7 (LCtrl, LShift, LAlt, LGUI, RCtrl, RShift, RAlt, RGUI).
+  // Diff against prevMod and press/release individual keys via pressRaw/releaseRaw.
+  for (int bit = 0; bit < 8; bit++) {
+    uint8_t mask    = 1 << bit;
+    uint8_t keycode = 0xE0 + bit;
+    bool was = (prevMod & mask) != 0;
+    bool is  = (mod     & mask) != 0;
+    if (is  && !was) hidKb.pressRaw(keycode);
+    if (!is &&  was) hidKb.releaseRaw(keycode);
+  }
 }
 
 void usbKeyDown(uint8_t keycode) {
@@ -440,7 +447,10 @@ void loop() {
     } else {
       typematicNext = millis() + TYPEMATIC_RATE_MS;
     }
-    usbApplyModifiers(typematicMod);
+    // Re-assert modifiers for typematic repeat (prevMod already matches typematicMod)
+    for (int bit = 0; bit < 8; bit++) {
+      if (typematicMod & (1 << bit)) hidKb.pressRaw(0xE0 + bit);
+    }
     hidKb.pressRaw(typematicKey);
   }
 
