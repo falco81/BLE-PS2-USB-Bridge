@@ -1,5 +1,6 @@
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include "esp_wifi.h"
 
 // ── PS/2 keyboard driver (from ps2kb.h / ps2kb.cpp) ─────────────────────────
 // ps2kb.h — Arduino port of esp32-ps2dev (keyboard only)
@@ -538,10 +539,10 @@ void ps2kb_task_send(void *arg) {
  *   PS/2 +5V  ————————————————————— VIN
  *
  * Serial commands (115200 baud):
- *   scan              Skenuj 10 sekund
+ *   scan              Scan BLE 10 seconds
  *   connect <mac>     Connect (3 attempts) and save
  *   forget            Clear saved keyboard and bonds
- *   status            Zobraz stav
+ *   status            Show connection status
  *   help              Show help
  *
  * Changes v1.6:
@@ -752,7 +753,7 @@ bool tryConnect(NimBLEAddress addr) {
     return false;
   }
 
-  Serial.printf("[BLE] Bridge aktivni — %d HID report(u)\n", subs);
+  Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
   return true;
 }
 
@@ -760,7 +761,7 @@ bool connectWithRetry(NimBLEAddress addr, int tries) {
   for (int i = 1; i <= tries; i++) {
     Serial.printf("[BLE] Attempt %d/%d: %s\n", i, tries, addr.toString().c_str());
     if (tryConnect(addr)) return true;
-    Serial.println("[BLE] Selhalo.");
+    Serial.println("[BLE] Failed.");
     if (i < tries) delay(1500);
   }
   return false;
@@ -784,7 +785,7 @@ void saveKeyboard(NimBLEAddress addr) {
   prefs.putString(NVS_KEY_MAC, savedMAC);
   prefs.putUChar(NVS_KEY_TYPE, savedType);
   prefs.end();
-  Serial.printf("[NVS] Ulozena: %s (typ %d)\n", savedMAC, savedType);
+  Serial.printf("[NVS] Saved: %s (type %d)\n", savedMAC, savedType);
 }
 
 void forgetKeyboard() {
@@ -799,24 +800,24 @@ void forgetKeyboard() {
   prefs.end();
   memset(savedMAC, 0, sizeof(savedMAC));
   memset(prevKeys, 0, 6); prevMod = 0;
-  Serial.println("[FORGET] Smazano. Pouzij: scan  pak  connect <mac>");
+  Serial.println("[FORGET] Cleared. Use: scan  then  connect <mac>");
 }
 
 // ── Serial console commands ───────────────────────────────────────────────────
 void printHelp() {
-  Serial.println("\nPrikazy:");
-  Serial.println("  scan              Skenuj BLE 10s");
-  Serial.println("  connect <mac>     Pripoj a uloz (3 pokusy)");
-  Serial.println("  forget            Smaz klavesnici");
-  Serial.println("  status            Zobraz stav");
-  Serial.println("  help              Tato napoveda\n");
+  Serial.println("\nCommands:");
+  Serial.println("  scan              Scan BLE 10s");
+  Serial.println("  connect <mac>     Connect and save (3 attempts)");
+  Serial.println("  forget            Clear saved keyboard");
+  Serial.println("  status            Show connection status");
+  Serial.println("  help              Show this help\n");
 }
 
 void cmdScan() {
-  if (scanEndAt != 0) { Serial.println("[SCAN] Probiha..."); return; }
+  if (scanEndAt != 0) { Serial.println("[SCAN] Already running..."); return; }
   NimBLEDevice::getScan()->stop(); delay(200);
   scanCount = 0;
-  Serial.println("[SCAN] Skenuji 10s — dej klavesnici do PAROVACIHO MODU");
+  Serial.println("[SCAN] Scanning 10s — put keyboard into PAIRING MODE");
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setActiveScan(true); scan->setInterval(50); scan->setWindow(45);
   scan->start(0, false);
@@ -833,17 +834,17 @@ void cmdConnect(String mac) {
   if (connectWithRetry(addr, CONNECT_TRIES))
     saveKeyboard(pClient->getPeerAddress());
   else
-    Serial.println("[BLE] Vsechny pokusy selhaly.");
+    Serial.println("[BLE] All attempts failed.");
 }
 
 void cmdStatus() {
   bool conn = pClient && pClient->isConnected();
-  Serial.printf("\nStav:   %s\nMAC:    %s\nBondy:  %d\n",
+  Serial.printf("\nStatus: %s\nMAC:    %s\nBonds:  %d\n",
     conn ? "PRIPOJENO" : "NEPRIPOJENO",
-    strlen(savedMAC) ? savedMAC : "(none)",
+    strlen(savedMAC) ? savedMAC : "(zadna)",
     NimBLEDevice::getNumBonds());
   if (conn) Serial.printf("Peer:   %s\n", pClient->getPeerAddress().toString().c_str());
-  if (!conn && reconnectAt) Serial.printf("Reconn: za %ldms\n", (long)(reconnectAt - millis()));
+  if (!conn && reconnectAt) Serial.printf("Reconn: in %ldms\n", (long)(reconnectAt - millis()));
   Serial.println();
 }
 
@@ -858,7 +859,7 @@ void handleSerial() {
   else if (line.equalsIgnoreCase("status"))  cmdStatus();
   else if (line.equalsIgnoreCase("help") ||
            line.equalsIgnoreCase("?"))       printHelp();
-  else Serial.printf("[CMD] Neznam '%s'\n", line.c_str());
+  else Serial.printf("[CMD] Unknown command: '%s'\n", line.c_str());
 }
 
 // ── BLE daemon task ──────────────────────────────────────────────────────────
@@ -872,7 +873,7 @@ void bleDaemonTask(void* arg) {
 
     if (strlen(savedMAC) == 0) continue;                     // no saved keyboard
     if (pClient && pClient->isConnected()) continue;          // all good
-    if (reconnectAt != 0) continue;                           // reconnect already scheduled
+    if (reconnectAt != 0) continue;                           // reconnect already scheduled by loop()
 
     // Keyboard lost and loop() hasn't caught it yet — schedule reconnect
     Serial.println("[DAEMON] Keyboard lost, scheduling reconnect...");
@@ -889,6 +890,10 @@ void bleDaemonTask(void* arg) {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  // Disable WiFi — not needed, saves ~20 mA
+  esp_wifi_stop();
+  esp_wifi_deinit();
 
   Serial.println("\n================================");
   Serial.println("  BLE -> PS/2 AT Bridge  v1.6");
@@ -929,7 +934,7 @@ void loop() {
     if (scanCount == 0)
       Serial.println("[SCAN] No devices found. Try again.");
     else
-      Serial.printf("[SCAN] Done — %d devices. Use: connect <mac>\n", scanCount);
+      Serial.printf("[SCAN] Done — %d devices found. Use: connect <mac>\n", scanCount);
   }
 
   // Disconnection detection
