@@ -56,5 +56,5 @@
     </marker>
   </defs>
 
-  <text x="400" y="185" fill="#555" font-size="11" text-anchor="middle">ESP32 emuluje AT PS/2 klávesnici — PC neví o BLE</text>
+  <text x="400" y="185" fill="#555" font-size="11" text-anchor="middle">ESP32 emulates an AT PS/2 keyboard — the PC has no knowledge of BLE</text>
 </svg>
