@@ -8,7 +8,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 
 ## Block Diagram
 
-![Block diagram](block_diagram.svg)
+![Block diagram](doc/block_diagram.svg)
 
 ---
 
@@ -38,7 +38,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 
 #### AT DIN-5 (used in this project)
 
-<img src="din5_male.png" width="200" alt="AT DIN-5 male connector"/>
+<img src="doc/din5_male.png" width="200" alt="AT DIN-5 male connector"/>
 
 | Pin | Signal | Description |
 |-----|--------|-------------|
@@ -50,7 +50,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 
 #### PS/2 Mini-DIN 6 (alternative — note different pinout!)
 
-<img src="minidins6_male.png" width="200" alt="PS/2 Mini-DIN 6 male connector"/>
+<img src="doc/minidins6_male.png" width="200" alt="PS/2 Mini-DIN 6 male connector"/>
 
 | Pin | Signal | Description |
 |-----|--------|-------------|
@@ -65,7 +65,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 
 ### Level Shifter
 
-<img src="level_shifter.png" width="220" alt="BSS138 IIC I2C 5V to 3.3V bidirectional level shifter"/>
+<img src="doc/level_shifter.png" width="220" alt="BSS138 IIC I2C 5V to 3.3V bidirectional level shifter"/>
 
 The BSS138-based bidirectional level shifter translates between ESP32's 3.3 V GPIO and the PC's 5 V PS/2 bus. It has built-in pull-up resistors on both sides — **no external resistors needed**.
 
@@ -248,7 +248,7 @@ BLE klávesnice → **USB HID klávesnice** pomocí nativního USB rozhraní ESP
 
 ### ESP32-S3 N16R8
 
-<img src="esp32s3_module.png" width="320" alt="ESP32-S3 N16R8 development module"/>
+<img src="doc/esp32s3_module.png" width="320" alt="ESP32-S3 N16R8 development module"/>
 
 | Parametr | Hodnota |
 |----------|---------|
@@ -272,7 +272,7 @@ BLE Keyboard  ──(BLE 5.0)──►  ESP32-S3  ──(USB-C)──►  PC
 
 ## Block Diagram
 
-![Block diagram S3](block_diagram_s3.svg)
+![Block diagram S3](doc/block_diagram_s3.svg)
 
 ## Software — `ble_usb_bridge_s3.ino`
 
