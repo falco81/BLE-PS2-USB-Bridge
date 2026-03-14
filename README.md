@@ -26,6 +26,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 - **Battery shortcut** — press **LCtrl+LAlt+PrintScreen** to type the keyboard battery percentage (e.g. `78%`)
 - **Status shortcut** — press **LCtrl+LAlt+LShift+PrintScreen** to type the full bridge status into any text field
 - **NVS storage** — paired keyboard remembered across reboots
+- **Keepalive** — periodic battery level read every 3 s keeps the BLE keyboard awake and prevents the 5–10 s input delay after inactivity
 - **WiFi disabled** — WiFi stack is deinitialised at startup, saving ~20 mA
 
 ---
@@ -310,6 +311,7 @@ bleDaemonTask (priority 1)
 | Connects but no input | Wrong HID report format | Check Serial log — `[HID]` lines should appear on keypress |
 | Reconnect takes a while | Keyboard not advertising yet | Normal — firmware scans and waits, connects as soon as keyboard is visible |
 | Lock key LEDs wrong | Bridge just connected | Press the lock key once to resync state |
+| 5–10 s input delay after idle | Keyboard entered BLE sleep | Fixed by keepalive — if it persists, reduce `KEEPALIVE_MS` |
 
 ---
 
@@ -488,3 +490,4 @@ Devices marked `*** BLE HID KEYBOARD ***` advertise an active HID service (UUID 
 ```
 
 ---
+
