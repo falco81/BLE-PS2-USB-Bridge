@@ -568,6 +568,7 @@ static PS2Keyboard    keyboard(PS2_CLK_PIN, PS2_DAT_PIN);
 static NimBLEClient*  pClient           = nullptr;
 static unsigned long  reconnectAt       = 0;
 static int            reconnectFailures = 0;
+static bool           reconnectScanActive = false; // scan-before-connect mode
 
 static Preferences    prefs;
 static char           savedMAC[18]      = "";
@@ -576,8 +577,13 @@ static uint8_t        savedType         = 1;
 static uint8_t        prevKeys[6]       = {0};
 static uint8_t        prevMod           = 0;
 
-static BLEUUID HID_SERVICE_UUID("00001812-0000-1000-8000-00805f9b34fb");
-static BLEUUID HID_REPORT_UUID ("00002a4d-0000-1000-8000-00805f9b34fb");
+static BLEUUID HID_SERVICE_UUID    ("00001812-0000-1000-8000-00805f9b34fb");
+static BLEUUID HID_REPORT_UUID     ("00002a4d-0000-1000-8000-00805f9b34fb");
+static BLEUUID BATTERY_SERVICE_UUID("0000180f-0000-1000-8000-00805f9b34fb");
+static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
+
+static int8_t         batteryLevel    = -1;  // -1 = unknown
+static volatile bool  statusRequested = false; // set by HID combo, handled in loop()
 
 static unsigned long  scanEndAt = 0;
 static int            scanCount = 0;
@@ -678,6 +684,14 @@ void processHIDReport(uint8_t* data, size_t len) {
   prevMod = mod;
   memcpy(prevKeys, keys, 6);
 
+  // Ctrl+Alt+PrintScreen → request status type-out
+  // LCtrl=bit0, LAlt=bit2  (or RCtrl=bit4, RAlt=bit6) + PrintScreen=0x46
+  bool ctrl = (mod & 0x01) || (mod & 0x10);
+  bool alt  = (mod & 0x04) || (mod & 0x40);
+  bool prtsc = false;
+  for (int i = 0; i < 6; i++) if (keys[i] == 0x46) { prtsc = true; break; }
+  if (ctrl && alt && prtsc) statusRequested = true;
+
   // Typematic: find first held non-modifier key (skip CapsLock 0x39)
   typematicKey = 0;
   for (int i = 0; i < 6; i++) {
@@ -703,12 +717,29 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar,
 // ── BLE scan ──────────────────────────────────────────────────────────────────
 class MyScanCallbacks : public NimBLEScanCallbacks {
   void onDiscovered(const NimBLEAdvertisedDevice* dev) override {
+    // Reconnect scan: detect saved keyboard and trigger immediate connect
+    if (reconnectScanActive && strlen(savedMAC) > 0) {
+      if (dev->getAddress().toString() == std::string(savedMAC)) {
+        Serial.println("[SCAN] Keyboard found — connecting...");
+        NimBLEDevice::getScan()->stop();
+        reconnectScanActive = false;
+        reconnectAt = millis() + 50; // connect almost immediately
+        return;
+      }
+    }
+    // Manual scan: print named devices
     if (!dev->haveName() || dev->getName().length() == 0) return;
     Serial.printf("  %-28s  %s\n",
       dev->getName().c_str(), dev->getAddress().toString().c_str());
     scanCount++;
   }
-  void onScanEnd(const NimBLEScanResults& r, int reason) override {}
+  void onScanEnd(const NimBLEScanResults& r, int reason) override {
+    if (reconnectScanActive) {
+      // Keyboard not seen in this scan window — retry scan
+      reconnectScanActive = false;
+      reconnectAt = millis() + 500; // short pause then scan again
+    }
+  }
 };
 
 // ── BLE connection ────────────────────────────────────────────────────────────
@@ -721,7 +752,7 @@ bool tryConnect(NimBLEAddress addr) {
   }
 
   pClient = NimBLEDevice::createClient();
-  pClient->setConnectionParams(6, 12, 0, 3200); // interval 7.5-15ms, supervision 32s
+  pClient->setConnectionParams(6, 12, 0, 3200);
   pClient->setConnectTimeout(12);
 
   if (!pClient->connect(addr)) {
@@ -738,10 +769,12 @@ bool tryConnect(NimBLEAddress addr) {
     return false;
   }
 
+  // Fetch only HID_REPORT_UUID characteristics — much faster than getCharacteristics(true)
   int subs = 0;
-  const std::vector<NimBLERemoteCharacteristic*>& chars = svc->getCharacteristics(true);
+  const std::vector<NimBLERemoteCharacteristic*>& chars =
+      svc->getCharacteristics(&HID_REPORT_UUID);
   for (NimBLERemoteCharacteristic* c : chars) {
-    if (c->getUUID() == HID_REPORT_UUID && c->canNotify()) {
+    if (c->canNotify()) {
       c->subscribe(true, notifyCallback);
       subs++;
     }
@@ -751,6 +784,23 @@ bool tryConnect(NimBLEAddress addr) {
     pClient->disconnect();
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
     return false;
+  }
+
+  // Subscribe to battery level notifications if available
+  batteryLevel = -1;
+  NimBLERemoteService* batSvc = pClient->getService(BATTERY_SERVICE_UUID);
+  if (batSvc) {
+    NimBLERemoteCharacteristic* batChar = batSvc->getCharacteristic(BATTERY_LEVEL_UUID);
+    if (batChar) {
+      if (batChar->canRead()) {
+        std::string val = batChar->readValue();
+        if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
+      }
+      if (batChar->canNotify())
+        batChar->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) {
+          if (l > 0) { batteryLevel = d[0]; } // updated silently, shown on status request
+        });
+    }
   }
 
   Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
@@ -837,15 +887,93 @@ void cmdConnect(String mac) {
     Serial.println("[BLE] All attempts failed.");
 }
 
-void cmdStatus() {
+// Build status as a String — shared by Serial output and PS/2 type-out
+String buildStatus() {
   bool conn = pClient && pClient->isConnected();
-  Serial.printf("\nStatus: %s\nMAC:    %s\nBonds:  %d\n",
-    conn ? "PRIPOJENO" : "NEPRIPOJENO",
-    strlen(savedMAC) ? savedMAC : "(zadna)",
-    NimBLEDevice::getNumBonds());
-  if (conn) Serial.printf("Peer:   %s\n", pClient->getPeerAddress().toString().c_str());
-  if (!conn && reconnectAt) Serial.printf("Reconn: in %ldms\n", (long)(reconnectAt - millis()));
-  Serial.println();
+  String s = "";
+  s += "\n--- BLE-PS2 Bridge status ---\n";
+  s += String("BLE:      ") + (conn ? "CONNECTED" : "DISCONNECTED") + "\n";
+  if (conn) {
+    NimBLEConnInfo info = pClient->getConnInfo();
+    s += String("Peer MAC: ") + pClient->getPeerAddress().toString().c_str() + "\n";
+    s += String("RSSI:     ") + pClient->getRssi() + " dBm\n";
+    s += String("Interval: ") + info.getConnInterval() + " ms\n";
+    s += String("Encrypt:  ") + (info.isEncrypted() ? "yes" : "no") + "\n";
+    s += String("Bonded:   ") + (info.isBonded()    ? "yes" : "no") + "\n";
+    if (batteryLevel >= 0)
+      s += String("Battery:  ") + batteryLevel + "%\n";
+    else
+      s += "Battery:  unknown\n";
+  } else {
+    if (reconnectScanActive)
+      s += "Scanning for keyboard...\n";
+    else if (reconnectAt)
+      s += String("Reconnect in: ") + (long)(reconnectAt - millis()) + " ms\n";
+    s += String("Failures: ") + reconnectFailures + "\n";
+  }
+  s += "\n";
+  s += String("NVS MAC:  ") + (strlen(savedMAC) ? savedMAC : "(none)") + "\n";
+  s += String("Bonds:    ") + NimBLEDevice::getNumBonds() + "\n";
+  s += "-----------------------------\n";
+  return s;
+}
+
+void cmdStatus() {
+  Serial.print(buildStatus());
+}
+
+// Type status text via PS/2 (called from loop() when statusRequested flag is set)
+void typeStatusViaPS2() {
+  String s = buildStatus();
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+    if (c == '\n') {
+      keyboard.keyHid_send(0x28, true);  // Enter press
+      delay(20);
+      keyboard.keyHid_send(0x28, false); // Enter release
+    } else if (c == ' ') {
+      keyboard.keyHid_send(0x2C, true);
+      delay(20);
+      keyboard.keyHid_send(0x2C, false);
+    } else if (c == '-') {
+      keyboard.keyHid_send(0x56, true);  // HID minus (international KB) or 0x2D
+      delay(20);
+      keyboard.keyHid_send(0x56, false);
+    } else if (c == '%') {
+      // Shift+5
+      keyboard.keyHid_send(0xE1, true);
+      keyboard.keyHid_send(0x22, true);
+      delay(20);
+      keyboard.keyHid_send(0x22, false);
+      keyboard.keyHid_send(0xE1, false);
+    } else if (c >= 'a' && c <= 'z') {
+      keyboard.keyHid_send(0x04 + (c - 'a'), true);
+      delay(20);
+      keyboard.keyHid_send(0x04 + (c - 'a'), false);
+    } else if (c >= 'A' && c <= 'Z') {
+      keyboard.keyHid_send(0xE1, true);  // LShift
+      keyboard.keyHid_send(0x04 + (c - 'A'), true);
+      delay(20);
+      keyboard.keyHid_send(0x04 + (c - 'A'), false);
+      keyboard.keyHid_send(0xE1, false);
+    } else if (c >= '0' && c <= '9') {
+      uint8_t k = (c == '0') ? 0x27 : 0x1E + (c - '1');
+      keyboard.keyHid_send(k, true);
+      delay(20);
+      keyboard.keyHid_send(k, false);
+    } else if (c == '.') {
+      keyboard.keyHid_send(0x37, true);
+      delay(20);
+      keyboard.keyHid_send(0x37, false);
+    } else if (c == ':') {
+      keyboard.keyHid_send(0xE1, true);
+      keyboard.keyHid_send(0x33, true);
+      delay(20);
+      keyboard.keyHid_send(0x33, false);
+      keyboard.keyHid_send(0xE1, false);
+    }
+    delay(30); // inter-character gap
+  }
 }
 
 void handleSerial() {
@@ -882,7 +1010,12 @@ void bleDaemonTask(void* arg) {
     typematicKey   = 0;
     typematicArmed = false;
     typematicNext  = 0;
-    reconnectAt    = millis() + 500; // fast reconnect — daemon detected it first
+    // Start scan — wait for keyboard to advertise before connecting
+    if (!reconnectScanActive) {
+      reconnectScanActive = true;
+      NimBLEDevice::getScan()->start(5000, false);
+      Serial.println("[SCAN] Waiting for keyboard to advertise...");
+    }
   }
 }
 
@@ -943,10 +1076,13 @@ void loop() {
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
     memset(prevKeys, 0, 6); prevMod = 0;
     reconnectFailures = 0;
-    reconnectAt = millis() + 2000;
+    // Start a scan to detect when keyboard starts advertising
+    reconnectScanActive = true;
+    NimBLEDevice::getScan()->start(5000, false); // 5s scan window
+    Serial.println("[SCAN] Waiting for keyboard to advertise...");
   }
 
-  // Reconnect
+  // Reconnect — triggered by scan callback when keyboard is seen
   if (reconnectAt && millis() >= reconnectAt && strlen(savedMAC) > 0) {
     reconnectAt = 0;
     if (!pClient || !pClient->isConnected()) {
@@ -956,10 +1092,18 @@ void loop() {
         reconnectFailures = 0;
       } else {
         reconnectFailures++;
-        Serial.printf("[BLE] Reconnect failed (%dx). Retrying in 2s\n", reconnectFailures);
-        reconnectAt = millis() + 2000;
+        Serial.printf("[BLE] Connect failed (%dx) — scanning again...\n", reconnectFailures);
+        // Back to scan mode — wait for keyboard to advertise again
+        reconnectScanActive = true;
+        NimBLEDevice::getScan()->start(5000, false);
       }
     }
+  }
+
+  // Status type-out via PS/2 (triggered by Ctrl+Alt+PrintScreen)
+  if (statusRequested) {
+    statusRequested = false;
+    typeStatusViaPS2();
   }
 
   // Typematic repeat
