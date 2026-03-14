@@ -23,7 +23,8 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 - **BIOS compatible** — responds to all POST commands including `GET_DEVICE_ID` (0xF2 → `0xAB 0x83`)
 - **Serial console** — `scan` / `connect` / `forget` / `status` commands at 115200 baud
 - **LED sync** — NumLock / CapsLock / ScrollLock state forwarded back to the BLE keyboard so indicators stay in sync
-- **Status shortcut** — press **Ctrl+Alt+PrintScreen** to type the bridge status into any text field
+- **Battery shortcut** — press **LCtrl+LAlt+PrintScreen** to type the keyboard battery percentage (e.g. `78%`)
+- **Status shortcut** — press **LCtrl+LAlt+LShift+PrintScreen** to type the full bridge status into any text field
 - **NVS storage** — paired keyboard remembered across reboots
 - **WiFi disabled** — WiFi stack is deinitialised at startup, saving ~20 mA
 
@@ -178,9 +179,16 @@ Bonds:    1
 
 Battery is shown only if the keyboard supports the BLE Battery Service (UUID 0x180F). If not supported, `Battery: unknown` is displayed.
 
-### Ctrl+Alt+PrintScreen shortcut
+### Keyboard shortcuts
 
-Press **Ctrl+Alt+PrintScreen** on the paired keyboard at any time to type the current bridge status into whatever text field has focus — Notepad, terminal, browser address bar, etc. This works without access to the Serial monitor.
+| Combination | Output |
+|-------------|--------|
+| **LCtrl + LAlt + PrtSc** | Battery percentage, e.g. `78%` |
+| **LCtrl + LAlt + LShift + PrtSc** | Full bridge status block |
+
+Both shortcuts type into whatever text field has focus — Notepad, terminal, browser address bar, etc. They work without access to the Serial monitor.
+
+Only **Left** modifier keys are recognised. The bridge releases all held modifier keys and stops typematic before typing the output, so the text is not corrupted by Ctrl/Alt being held on the PC side.
 
 ### Lock key LED synchronisation
 
@@ -386,7 +394,8 @@ Since the BLE HID Usage Table (Keyboard/Keypad, Usage Page 0x07) is identical to
 | Driver | None (PS/2 native) | None (HID plug & play) |
 | WiFi disabled | ✅ saves ~20 mA | — |
 | Battery level | ✅ | ✅ |
-| Ctrl+Alt+PrtSc status | ✅ via PS/2 | ✅ via USB HID |
+| LCtrl+LAlt+PrtSc → battery % | ✅ | ✅ |
+| LCtrl+LAlt+LShift+PrtSc → status | ✅ via PS/2 | ✅ via USB HID |
 | LED sync | ✅ via 0xED forward | ✅ via toggle tracking |
 
 ### Serial Console
