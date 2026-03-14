@@ -22,6 +22,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 - **Battery level** — reads and displays keyboard battery percentage if supported
 - **BIOS compatible** — responds to all POST commands including `GET_DEVICE_ID` (0xF2 → `0xAB 0x83`)
 - **Serial console** — `scan` / `connect` / `forget` / `status` commands at 115200 baud
+- **LED sync** — NumLock / CapsLock / ScrollLock state forwarded back to the BLE keyboard so indicators stay in sync
 - **Status shortcut** — press **Ctrl+Alt+PrintScreen** to type the bridge status into any text field
 - **NVS storage** — paired keyboard remembered across reboots
 - **WiFi disabled** — WiFi stack is deinitialised at startup, saving ~20 mA
@@ -181,6 +182,20 @@ Battery is shown only if the keyboard supports the BLE Battery Service (UUID 0x1
 
 Press **Ctrl+Alt+PrintScreen** on the paired keyboard at any time to type the current bridge status into whatever text field has focus — Notepad, terminal, browser address bar, etc. This works without access to the Serial monitor.
 
+### Lock key LED synchronisation
+
+NumLock, CapsLock and ScrollLock indicator LEDs on the BLE keyboard stay in sync with the PC state automatically.
+
+In the **PS/2 variant**, the PC sends a `0xED` LED command to the bridge whenever lock state changes. The bridge remaps the bitmask (PS/2 and BLE HID use different bit order) and writes it to the BLE keyboard's HID Output Report characteristic.
+
+In the **USB variant**, the PC sends a USB HID Output Report directly. Since Arduino core does not expose this callback, the bridge tracks lock key toggle events locally and updates the BLE keyboard accordingly.
+
+| PS/2 bit | BLE HID bit | Key |
+|----------|------------|-----|
+| bit 1 | bit 0 | NumLock |
+| bit 2 | bit 1 | CapsLock |
+| bit 0 | bit 2 | ScrollLock |
+
 ### Automatic reconnect
 
 When the keyboard disconnects, the firmware starts a BLE scan and waits for the keyboard to begin advertising, then connects immediately. This eliminates the repeated 12-second connection timeouts that occur when connecting to a device that has not yet started advertising.
@@ -251,6 +266,7 @@ bleDaemonTask (priority 1)
 | Can't connect BLE | Keyboard not in pairing mode | Use `forget` then `scan`, put keyboard into pairing mode |
 | Connects but no input | Wrong HID report format | Check Serial log — `[HID]` lines should appear on keypress |
 | Reconnect takes a while | Keyboard not advertising yet | Normal — firmware scans and waits, connects as soon as keyboard is visible |
+| Lock key LEDs wrong | Bridge just connected | Press the lock key once to resync state |
 
 ---
 
@@ -371,6 +387,7 @@ Since the BLE HID Usage Table (Keyboard/Keypad, Usage Page 0x07) is identical to
 | WiFi disabled | ✅ saves ~20 mA | — |
 | Battery level | ✅ | ✅ |
 | Ctrl+Alt+PrtSc status | ✅ via PS/2 | ✅ via USB HID |
+| LED sync | ✅ via 0xED forward | ✅ via toggle tracking |
 
 ### Serial Console
 
@@ -427,4 +444,3 @@ Devices marked `*** BLE HID KEYBOARD ***` advertise an active HID service (UUID 
 ```
 
 ---
-
