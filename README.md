@@ -183,12 +183,47 @@ Battery is shown only if the keyboard supports the BLE Battery Service (UUID 0x1
 
 | Combination | Output |
 |-------------|--------|
-| **LCtrl + LAlt + PrtSc** | Battery percentage, e.g. `78%` |
+| **LCtrl + LAlt + PrtSc** | Battery percentage |
 | **LCtrl + LAlt + LShift + PrtSc** | Full bridge status block |
 
 Both shortcuts type into whatever text field has focus — Notepad, terminal, browser address bar, etc. They work without access to the Serial monitor.
 
 Only **Left** modifier keys are recognised. The bridge releases all held modifier keys and stops typematic before typing the output, so the text is not corrupted by Ctrl/Alt being held on the PC side.
+
+**LCtrl + LAlt + PrtSc** example output:
+```
+78%
+```
+If the keyboard does not support battery reporting: `?%`
+
+**LCtrl + LAlt + LShift + PrtSc** example output:
+```
+
+--- BLE-PS2 Bridge status ---
+BLE:      CONNECTED
+Peer MAC: dc:35:77:e9:cf:a1
+RSSI:     -52 dBm
+Interval: 48 ms
+Encrypt:  yes
+Bonded:   yes
+Battery:  78%
+
+NVS MAC:  dc:35:77:e9:cf:a1
+Bonds:    1
+-----------------------------
+```
+When disconnected:
+```
+
+--- BLE-PS2 Bridge status ---
+BLE:      DISCONNECTED
+Scanning for keyboard...
+Failures: 3
+
+NVS MAC:  dc:35:77:e9:cf:a1
+Bonds:    1
+-----------------------------
+```
 
 ### Lock key LED synchronisation
 
