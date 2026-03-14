@@ -49,7 +49,8 @@ static USBHIDKeyboard    hidKb;
 
 static NimBLEClient*     pClient           = nullptr;
 static unsigned long     reconnectAt       = 0;
-static int               reconnectFailures = 0;
+static int               reconnectFailures   = 0;
+static bool              reconnectScanActive = false;
 
 static Preferences       prefs;
 static char              savedMAC[18]      = "";
@@ -58,8 +59,13 @@ static uint8_t           savedType         = 1;
 static uint8_t           prevKeys[6]       = {0};
 static uint8_t           prevMod           = 0;
 
-static BLEUUID HID_SERVICE_UUID("00001812-0000-1000-8000-00805f9b34fb");
-static BLEUUID HID_REPORT_UUID ("00002a4d-0000-1000-8000-00805f9b34fb");
+static BLEUUID HID_SERVICE_UUID    ("00001812-0000-1000-8000-00805f9b34fb");
+static BLEUUID HID_REPORT_UUID     ("00002a4d-0000-1000-8000-00805f9b34fb");
+static BLEUUID BATTERY_SERVICE_UUID("0000180f-0000-1000-8000-00805f9b34fb");
+static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
+
+static int8_t         batteryLevel    = -1;
+static volatile bool  statusRequested = false;
 
 static unsigned long     scanEndAt  = 0;
 static int               scanCount  = 0;
@@ -186,6 +192,13 @@ void processHIDReport(uint8_t* data, size_t len) {
   prevMod = mod;
   memcpy(prevKeys, keys, 6);
 
+  // Ctrl+Alt+PrintScreen → request status output
+  bool ctrl  = (mod & 0x01) || (mod & 0x10);
+  bool alt   = (mod & 0x04) || (mod & 0x40);
+  bool prtsc = false;
+  for (int i = 0; i < 6; i++) if (keys[i] == 0x46) { prtsc = true; break; }
+  if (ctrl && alt && prtsc) statusRequested = true;
+
   // Typematic — first held key (skip CapsLock 0x39)
   typematicKey = 0;
   typematicMod = mod;
@@ -212,12 +225,28 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar,
 // ── BLE scan ──────────────────────────────────────────────────────────────────
 class MyScanCallbacks : public NimBLEScanCallbacks {
   void onDiscovered(const NimBLEAdvertisedDevice* dev) override {
+    // Reconnect scan: detect saved keyboard
+    if (reconnectScanActive && strlen(savedMAC) > 0) {
+      if (dev->getAddress().toString() == std::string(savedMAC)) {
+        Serial.println("[SCAN] Keyboard found — connecting...");
+        NimBLEDevice::getScan()->stop();
+        reconnectScanActive = false;
+        reconnectAt = millis() + 50;
+        return;
+      }
+    }
+    // Manual scan: print named devices
     if (!dev->haveName() || dev->getName().length() == 0) return;
     Serial.printf("  %-30s  %s\n",
       dev->getName().c_str(), dev->getAddress().toString().c_str());
     scanCount++;
   }
-  void onScanEnd(const NimBLEScanResults& r, int reason) override {}
+  void onScanEnd(const NimBLEScanResults& r, int reason) override {
+    if (reconnectScanActive) {
+      reconnectScanActive = false;
+      reconnectAt = millis() + 500;
+    }
+  }
 };
 
 // ── BLE connection ────────────────────────────────────────────────────────────
@@ -255,7 +284,7 @@ bool tryConnect(NimBLEAddress addr) {
 
   if (!pClient->connect(addr)) {
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
-    Serial.println("[BLE] Pripojeni selhalo.");
+    Serial.println("[BLE] Connection failed.");
     return false;
   }
 
@@ -269,17 +298,110 @@ bool tryConnect(NimBLEAddress addr) {
     return false;
   }
 
+  // Fetch only HID_REPORT_UUID characteristics — faster than getCharacteristics(true)
   int subs = 0;
-  const std::vector<NimBLERemoteCharacteristic*>& chars = svc->getCharacteristics(true);
+  const std::vector<NimBLERemoteCharacteristic*>& chars =
+      svc->getCharacteristics(&HID_REPORT_UUID);
   for (NimBLERemoteCharacteristic* c : chars) {
-    if (c->getUUID() == HID_REPORT_UUID && c->canNotify()) {
+    if (c->canNotify()) {
       c->subscribe(true, notifyCallback);
       subs++;
     }
   }
 
-  Serial.printf("[BLE] Connected. Subscriptions: %d\n", subs);
-  return subs > 0;
+  if (subs == 0) {
+    pClient->disconnect();
+    NimBLEDevice::deleteClient(pClient); pClient = nullptr;
+    return false;
+  }
+
+  // Battery level
+  batteryLevel = -1;
+  NimBLERemoteService* batSvc = pClient->getService(BATTERY_SERVICE_UUID);
+  if (batSvc) {
+    NimBLERemoteCharacteristic* batChar = batSvc->getCharacteristic(BATTERY_LEVEL_UUID);
+    if (batChar) {
+      if (batChar->canRead()) {
+        std::string val = batChar->readValue();
+        if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
+      }
+      if (batChar->canNotify())
+        batChar->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) {
+          if (l > 0) { batteryLevel = d[0]; }
+        });
+    }
+  }
+
+  Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
+  return true;
+}
+
+// ── Status output ────────────────────────────────────────────────────────────
+String buildStatus() {
+  bool conn = pClient && pClient->isConnected();
+  String s = "";
+  s += "\n--- BLE-USB Bridge status ---\n";
+  s += String("BLE:      ") + (conn ? "CONNECTED" : "DISCONNECTED") + "\n";
+  if (conn) {
+    NimBLEConnInfo info = pClient->getConnInfo();
+    s += String("Peer MAC: ") + pClient->getPeerAddress().toString().c_str() + "\n";
+    s += String("RSSI:     ") + pClient->getRssi() + " dBm\n";
+    s += String("Interval: ") + info.getConnInterval() + " ms\n";
+    s += String("Encrypt:  ") + (info.isEncrypted() ? "yes" : "no") + "\n";
+    s += String("Bonded:   ") + (info.isBonded()    ? "yes" : "no") + "\n";
+    if (batteryLevel >= 0)
+      s += String("Battery:  ") + batteryLevel + "%\n";
+    else
+      s += "Battery:  unknown\n";
+  } else {
+    if (reconnectScanActive)
+      s += "Scanning for keyboard...\n";
+    else if (reconnectAt)
+      s += String("Reconnect in: ") + (long)(reconnectAt - millis()) + " ms\n";
+    s += String("Failures: ") + reconnectFailures + "\n";
+  }
+  s += "\n";
+  s += String("NVS MAC:  ") + (strlen(savedMAC) ? savedMAC : "(none)") + "\n";
+  s += String("Bonds:    ") + NimBLEDevice::getNumBonds() + "\n";
+  s += "-----------------------------\n";
+  return s;
+}
+
+// Type status via USB HID keyboard (for Ctrl+Alt+PrintScreen in any text field)
+void typeStatusViaUSB() {
+  hidKb.releaseAll();
+  delay(50);
+  String s = buildStatus();
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+    if (c == '\n') {
+      hidKb.pressRaw(0x28); delay(20); hidKb.releaseRaw(0x28);
+    } else if (c == ' ') {
+      hidKb.pressRaw(0x2C); delay(20); hidKb.releaseRaw(0x2C);
+    } else if (c == '-') {
+      hidKb.pressRaw(0x2D); delay(20); hidKb.releaseRaw(0x2D);
+    } else if (c == '%') {
+      hidKb.pressRaw(0xE1); hidKb.pressRaw(0x22); delay(20);
+      hidKb.releaseRaw(0x22); hidKb.releaseRaw(0xE1);
+    } else if (c >= 'a' && c <= 'z') {
+      hidKb.pressRaw(0x04 + (c - 'a')); delay(20);
+      hidKb.releaseRaw(0x04 + (c - 'a'));
+    } else if (c >= 'A' && c <= 'Z') {
+      hidKb.pressRaw(0xE1);
+      hidKb.pressRaw(0x04 + (c - 'A')); delay(20);
+      hidKb.releaseRaw(0x04 + (c - 'A')); hidKb.releaseRaw(0xE1);
+    } else if (c >= '0' && c <= '9') {
+      uint8_t k = (c == '0') ? 0x27 : 0x1E + (c - '1');
+      hidKb.pressRaw(k); delay(20); hidKb.releaseRaw(k);
+    } else if (c == '.') {
+      hidKb.pressRaw(0x37); delay(20); hidKb.releaseRaw(0x37);
+    } else if (c == ':') {
+      hidKb.pressRaw(0xE1); hidKb.pressRaw(0x33); delay(20);
+      hidKb.releaseRaw(0x33); hidKb.releaseRaw(0xE1);
+    }
+    delay(30);
+  }
+  hidKb.releaseAll();
 }
 
 // ── Serial konzole ────────────────────────────────────────────────────────────
@@ -336,11 +458,7 @@ void handleSerial() {
     reconnectAt = 0;
     Serial.println("[NVS] Cleared. Use 'scan' then 'connect <mac>'.");
   } else if (line == "status") {
-    Serial.printf("[STATUS] BLE: %s\n",
-      (pClient && pClient->isConnected()) ? "CONNECTED" : "DISCONNECTED");
-    Serial.printf("[STATUS] Saved MAC: %s\n",
-      strlen(savedMAC) ? savedMAC : "(none)");
-    Serial.printf("[STATUS] Bonds: %d\n", NimBLEDevice::getNumBonds());
+    Serial.print(buildStatus());
   } else {
     Serial.printf("[ERR] Unknown command: %s\n", line.c_str());
   }
@@ -359,8 +477,12 @@ void bleDaemonTask(void* arg) {
     typematicKey   = 0;
     typematicArmed = false;
     typematicNext  = 0;
-    hidKb.releaseAll();   // release all USB keys
-    reconnectAt = millis() + 500;
+    hidKb.releaseAll();
+    if (!reconnectScanActive) {
+      reconnectScanActive = true;
+      NimBLEDevice::getScan()->start(5000, false);
+      Serial.println("[SCAN] Waiting for keyboard to advertise...");
+    }
   }
 }
 
@@ -403,7 +525,7 @@ void setup() {
 void loop() {
   handleSerial();
 
-  // Konec scanu
+  // Scan end
   if (scanEndAt && millis() >= scanEndAt) {
     scanEndAt = 0;
     NimBLEDevice::getScan()->stop();
@@ -420,10 +542,12 @@ void loop() {
     memset(prevKeys, 0, 6); prevMod = 0;
     hidKb.releaseAll();
     reconnectFailures = 0;
-    reconnectAt = millis() + 2000;
+    reconnectScanActive = true;
+    NimBLEDevice::getScan()->start(5000, false);
+    Serial.println("[SCAN] Waiting for keyboard to advertise...");
   }
 
-  // Reconnect
+  // Reconnect — triggered by scan callback when keyboard is seen
   if (reconnectAt && millis() >= reconnectAt && strlen(savedMAC) > 0) {
     reconnectAt = 0;
     if (!pClient || !pClient->isConnected()) {
@@ -433,10 +557,17 @@ void loop() {
         reconnectFailures = 0;
       } else {
         reconnectFailures++;
-        Serial.printf("[BLE] Reconnect failed (%dx). Retrying in 2s\n", reconnectFailures);
-        reconnectAt = millis() + 2000;
+        Serial.printf("[BLE] Connect failed (%dx) — scanning again...\n", reconnectFailures);
+        reconnectScanActive = true;
+        NimBLEDevice::getScan()->start(5000, false);
       }
     }
+  }
+
+  // Status type-out via USB HID (triggered by Ctrl+Alt+PrintScreen)
+  if (statusRequested) {
+    statusRequested = false;
+    typeStatusViaUSB();
   }
 
   // Typematic repeat
