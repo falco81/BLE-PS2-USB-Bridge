@@ -596,7 +596,10 @@ static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
 static int8_t         batteryLevel    = -1;  // -1 = unknown
 static volatile bool  statusRequested  = false; // LCtrl+LAlt+LShift+PrtSc
 static volatile bool  batteryRequested = false; // LCtrl+LAlt+PrtSc
-static NimBLERemoteCharacteristic* pLedChar = nullptr; // HID output report (LED state)
+static NimBLERemoteCharacteristic* pLedChar  = nullptr; // HID output report (LED state)
+static NimBLERemoteCharacteristic* pBatChar  = nullptr; // battery level (used for keepalive)
+static unsigned long  keepaliveAt = 0;        // next keepalive read
+#define KEEPALIVE_MS  3000                    // read battery every 3s to prevent keyboard sleep
 
 static unsigned long  scanEndAt = 0;
 static int            scanCount = 0;
@@ -821,6 +824,7 @@ bool tryConnect(NimBLEAddress addr) {
       if (batChar->canRead()) {
         std::string val = batChar->readValue();
         if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
+        pBatChar = batChar; // save for keepalive reads
       }
       if (batChar->canNotify())
         batChar->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) {
@@ -828,6 +832,7 @@ bool tryConnect(NimBLEAddress addr) {
         });
     }
   }
+  keepaliveAt = millis() + KEEPALIVE_MS;
 
   Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
   return true;
@@ -871,6 +876,8 @@ void forgetKeyboard() {
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
   }
   pLedChar = nullptr;
+  pBatChar = nullptr;
+  keepaliveAt = 0;
   NimBLEDevice::deleteAllBonds();
   prefs.begin(NVS_NS, false);
   prefs.remove(NVS_KEY_MAC); prefs.remove(NVS_KEY_TYPE);
@@ -1156,6 +1163,14 @@ void loop() {
     pendingLedMask = 0xFF;
     pLedChar->writeValue(&led, 1, false);
     Serial.printf("[LED] BLE LED mask 0x%02X\n", led);
+  }
+
+  // Keepalive — periodic battery read prevents keyboard from entering deep sleep
+  if (keepaliveAt && millis() >= keepaliveAt && pBatChar &&
+      pClient && pClient->isConnected()) {
+    keepaliveAt = millis() + KEEPALIVE_MS;
+    std::string val = pBatChar->readValue();
+    if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
   }
 
   // Battery type-out (LCtrl+LAlt+PrtSc)
