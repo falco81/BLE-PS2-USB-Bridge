@@ -2,6 +2,10 @@
 #include <Preferences.h>
 #include "esp_wifi.h"
 
+// LED state pending forward to BLE keyboard — set by PS/2 class, read in loop()
+// 0xFF = no pending update
+static volatile uint8_t pendingLedMask = 0xFF;
+
 // ── PS/2 keyboard driver (from ps2kb.h / ps2kb.cpp) ─────────────────────────
 // ps2kb.h — Arduino port of esp32-ps2dev (keyboard only)
 // Based on: https://github.com/hamberthm/esp32-bt2ps2
@@ -336,8 +340,15 @@ void PS2Keyboard::reply_to_host(uint8_t cmd) {
         ps2_delay_us(PS2KB_BYTE_INTERVAL_US);
         while (ps2_write(0xFA) != 0) vTaskDelay(1);
         ps2_delay_us(PS2KB_BYTE_INTERVAL_US);
-        // val bits: 0=ScrollLock 1=NumLock 2=CapsLock — could log if needed
+        // PS/2 LED bits: 0=ScrollLock 1=NumLock 2=CapsLock
+        // BLE HID LED bits: 0=NumLock  1=CapsLock  2=ScrollLock
         Serial.printf("[PS/2] LED mask 0x%02X\n", val);
+        // Remap and post — forwarded to BLE in loop() to avoid class scope issue
+        uint8_t bleLed = 0;
+        if (val & 0x02) bleLed |= 0x01; // NumLock
+        if (val & 0x04) bleLed |= 0x02; // CapsLock
+        if (val & 0x01) bleLed |= 0x04; // ScrollLock
+        pendingLedMask = bleLed;
       }
       break;
 
@@ -584,6 +595,7 @@ static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
 
 static int8_t         batteryLevel    = -1;  // -1 = unknown
 static volatile bool  statusRequested = false; // set by HID combo, handled in loop()
+static NimBLERemoteCharacteristic* pLedChar = nullptr; // HID output report (LED state)
 
 static unsigned long  scanEndAt = 0;
 static int            scanCount = 0;
@@ -786,6 +798,17 @@ bool tryConnect(NimBLEAddress addr) {
     return false;
   }
 
+  // Find HID Output Report characteristic for LED state forwarding
+  // It shares UUID 0x2a4d with input reports but is writable, not notifiable
+  pLedChar = nullptr;
+  for (NimBLERemoteCharacteristic* c : chars) {
+    if (c->canWrite()) {
+      pLedChar = c;
+      break;
+    }
+  }
+  if (pLedChar) Serial.println("[BLE] LED output char found");
+
   // Subscribe to battery level notifications if available
   batteryLevel = -1;
   NimBLERemoteService* batSvc = pClient->getService(BATTERY_SERVICE_UUID);
@@ -844,6 +867,7 @@ void forgetKeyboard() {
     if (pClient->isConnected()) pClient->disconnect();
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
   }
+  pLedChar = nullptr;
   NimBLEDevice::deleteAllBonds();
   prefs.begin(NVS_NS, false);
   prefs.remove(NVS_KEY_MAC); prefs.remove(NVS_KEY_TYPE);
@@ -1098,6 +1122,14 @@ void loop() {
         NimBLEDevice::getScan()->start(5000, false);
       }
     }
+  }
+
+  // Forward LED state to BLE keyboard when PS/2 host updates LEDs
+  if (pendingLedMask != 0xFF && pLedChar) {
+    uint8_t led = pendingLedMask;
+    pendingLedMask = 0xFF;
+    pLedChar->writeValue(&led, 1, false);
+    Serial.printf("[LED] BLE LED mask 0x%02X\n", led);
   }
 
   // Status type-out via PS/2 (triggered by Ctrl+Alt+PrintScreen)

@@ -66,6 +66,7 @@ static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
 
 static int8_t         batteryLevel    = -1;
 static volatile bool  statusRequested = false;
+static NimBLERemoteCharacteristic* pLedChar = nullptr;
 
 static unsigned long     scanEndAt  = 0;
 static int               scanCount  = 0;
@@ -192,6 +193,28 @@ void processHIDReport(uint8_t* data, size_t len) {
   prevMod = mod;
   memcpy(prevKeys, keys, 6);
 
+  // Forward LED state to BLE keyboard on lock key press
+  // PC sends USB HID output reports but they are not easily interceptable
+  // in Arduino core, so we track lock key toggles ourselves.
+  {
+    static uint8_t bleLedMask = 0;
+    uint8_t lockKeys[] = { 0x53, 0x39, 0x47 }; // NumLock, CapsLock, ScrollLock
+    uint8_t ledBits[]  = { 0x01, 0x02, 0x04 }; // BLE HID LED bits
+    for (int k = 0; k < 3; k++) {
+      bool isDown  = false;
+      bool wasDown = false;
+      for (int i = 0; i < 6; i++) if (keys[i]     == lockKeys[k]) isDown  = true;
+      for (int i = 0; i < 6; i++) if (prevKeys[i] == lockKeys[k]) wasDown = true;
+      if (isDown && !wasDown) {  // key just pressed
+        bleLedMask ^= ledBits[k];
+        if (pLedChar) {
+          pLedChar->writeValue(&bleLedMask, 1, false);
+          Serial.printf("[LED] BLE LED mask 0x%02X\n", bleLedMask);
+        }
+      }
+    }
+  }
+
   // Ctrl+Alt+PrintScreen → request status output
   bool ctrl  = (mod & 0x01) || (mod & 0x10);
   bool alt   = (mod & 0x04) || (mod & 0x40);
@@ -314,6 +337,16 @@ bool tryConnect(NimBLEAddress addr) {
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
     return false;
   }
+
+  // Find HID Output Report characteristic for LED state forwarding
+  pLedChar = nullptr;
+  for (NimBLERemoteCharacteristic* c : chars) {
+    if (c->canWrite()) {
+      pLedChar = c;
+      break;
+    }
+  }
+  if (pLedChar) Serial.println("[BLE] LED output char found");
 
   // Battery level
   batteryLevel = -1;
@@ -452,6 +485,7 @@ void handleSerial() {
     prefs.begin(NVS_NS, false);
     prefs.clear();
     prefs.end();
+    pLedChar = nullptr;
     NimBLEDevice::deleteAllBonds();
     memset(savedMAC, 0, sizeof(savedMAC));
     memset(prevKeys, 0, 6); prevMod = 0;
