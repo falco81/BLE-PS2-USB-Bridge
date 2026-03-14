@@ -594,12 +594,9 @@ static BLEUUID BATTERY_SERVICE_UUID("0000180f-0000-1000-8000-00805f9b34fb");
 static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
 
 static int8_t         batteryLevel    = -1;  // -1 = unknown
-static volatile bool  statusRequested  = false; // LCtrl+LAlt+LShift+PrtSc
-static volatile bool  batteryRequested = false; // LCtrl+LAlt+PrtSc
-static NimBLERemoteCharacteristic* pLedChar  = nullptr; // HID output report (LED state)
-static NimBLERemoteCharacteristic* pBatChar  = nullptr; // battery level (used for keepalive)
-static unsigned long  keepaliveAt = 0;        // next keepalive read
-#define KEEPALIVE_MS  3000                    // read battery every 3s to prevent keyboard sleep
+static volatile bool  statusRequested = false; // set by HID combo, handled in loop()
+static NimBLERemoteCharacteristic* pLedChar = nullptr; // HID output report (LED state)
+static NimBLERemoteCharacteristic* pBatChar = nullptr; // battery characteristic for keepalive
 
 static unsigned long  scanEndAt = 0;
 static int            scanCount = 0;
@@ -700,15 +697,13 @@ void processHIDReport(uint8_t* data, size_t len) {
   prevMod = mod;
   memcpy(prevKeys, keys, 6);
 
-  // Hotkey detection — Left modifiers only
-  // LCtrl=bit0  LShift=bit1  LAlt=bit2  PrintScreen=0x46
-  bool lctrl  = (mod & 0x01) != 0;
-  bool lalt   = (mod & 0x04) != 0;
-  bool lshift = (mod & 0x02) != 0;
-  bool prtsc  = false;
-  for (int i = 0; i < 6; i++) if (keys[i] == 0x46 || keys[i] == 0x9A) { prtsc = true; break; }
-  if (lctrl && lalt && lshift && prtsc)  statusRequested  = true;
-  if (lctrl && lalt && !lshift && prtsc) batteryRequested = true;
+  // Ctrl+Alt+PrintScreen → request status type-out
+  // LCtrl=bit0, LAlt=bit2  (or RCtrl=bit4, RAlt=bit6) + PrintScreen=0x46
+  bool ctrl = (mod & 0x01) || (mod & 0x10);
+  bool alt  = (mod & 0x04) || (mod & 0x40);
+  bool prtsc = false;
+  for (int i = 0; i < 6; i++) if (keys[i] == 0x46) { prtsc = true; break; }
+  if (ctrl && alt && prtsc) statusRequested = true;
 
   // Typematic: find first held non-modifier key (skip CapsLock 0x39)
   typematicKey = 0;
@@ -824,7 +819,7 @@ bool tryConnect(NimBLEAddress addr) {
       if (batChar->canRead()) {
         std::string val = batChar->readValue();
         if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
-        pBatChar = batChar; // save for keepalive reads
+        pBatChar = batChar;
       }
       if (batChar->canNotify())
         batChar->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) {
@@ -832,7 +827,6 @@ bool tryConnect(NimBLEAddress addr) {
         });
     }
   }
-  keepaliveAt = millis() + KEEPALIVE_MS;
 
   Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
   return true;
@@ -877,7 +871,6 @@ void forgetKeyboard() {
   }
   pLedChar = nullptr;
   pBatChar = nullptr;
-  keepaliveAt = 0;
   NimBLEDevice::deleteAllBonds();
   prefs.begin(NVS_NS, false);
   prefs.remove(NVS_KEY_MAC); prefs.remove(NVS_KEY_TYPE);
@@ -956,29 +949,6 @@ void cmdStatus() {
   Serial.print(buildStatus());
 }
 
-// Type battery percentage via PS/2 (e.g. "78%")
-void typeBatteryViaPS2() {
-  String s = (batteryLevel >= 0) ? (String(batteryLevel) + "%") : "?%";
-  for (int i = 0; i < (int)s.length(); i++) {
-    char c = s[i];
-    if (c >= '0' && c <= '9') {
-      uint8_t k = (c == '0') ? 0x27 : 0x1E + (c - '1');
-      keyboard.keyHid_send(k, true);  delay(20);
-      keyboard.keyHid_send(k, false); delay(30);
-    } else if (c == '%') {
-      keyboard.keyHid_send(0xE1, true);
-      keyboard.keyHid_send(0x22, true);  delay(20);
-      keyboard.keyHid_send(0x22, false);
-      keyboard.keyHid_send(0xE1, false); delay(30);
-    } else if (c == '?') {
-      keyboard.keyHid_send(0xE1, true);
-      keyboard.keyHid_send(0x38, true);  delay(20);
-      keyboard.keyHid_send(0x38, false);
-      keyboard.keyHid_send(0xE1, false); delay(30);
-    }
-  }
-}
-
 // Type status text via PS/2 (called from loop() when statusRequested flag is set)
 void typeStatusViaPS2() {
   String s = buildStatus();
@@ -1054,7 +1024,18 @@ void handleSerial() {
 
 void bleDaemonTask(void* arg) {
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(3000)); // check every 3 s
+    vTaskDelay(pdMS_TO_TICKS(2000)); // check every 2s
+
+    // Keepalive — periodic GATT read to keep keyboard HID layer active
+    if (pClient && pClient->isConnected()) {
+      if (pBatChar) {
+        std::string val = pBatChar->readValue();
+        if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
+      } else if (pLedChar) {
+        uint8_t led = 0;
+        pLedChar->writeValue(&led, 1, false);
+      }
+    }
 
     if (strlen(savedMAC) == 0) continue;                     // no saved keyboard
     if (pClient && pClient->isConnected()) continue;          // all good
@@ -1165,34 +1146,9 @@ void loop() {
     Serial.printf("[LED] BLE LED mask 0x%02X\n", led);
   }
 
-  // Keepalive — periodic battery read prevents keyboard from entering deep sleep
-  if (keepaliveAt && millis() >= keepaliveAt && pBatChar &&
-      pClient && pClient->isConnected()) {
-    keepaliveAt = millis() + KEEPALIVE_MS;
-    std::string val = pBatChar->readValue();
-    if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
-  }
-
-  // Battery type-out (LCtrl+LAlt+PrtSc)
-  if (batteryRequested) {
-    batteryRequested = false;
-    typematicKey = 0; typematicNext = 0; // stop typematic before typing
-    // Release all held modifiers so they don't interfere with typed output
-    keyboard.keyHid_send(0xE0, false); // LCtrl
-    keyboard.keyHid_send(0xE2, false); // LAlt
-    keyboard.keyHid_send(0xE1, false); // LShift
-    delay(50);
-    typeBatteryViaPS2();
-  }
-
-  // Status type-out (LCtrl+LAlt+LShift+PrtSc)
+  // Status type-out via PS/2 (triggered by Ctrl+Alt+PrintScreen)
   if (statusRequested) {
     statusRequested = false;
-    typematicKey = 0; typematicNext = 0;
-    keyboard.keyHid_send(0xE0, false);
-    keyboard.keyHid_send(0xE2, false);
-    keyboard.keyHid_send(0xE1, false);
-    delay(50);
     typeStatusViaPS2();
   }
 

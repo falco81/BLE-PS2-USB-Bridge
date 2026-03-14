@@ -69,8 +69,6 @@ static volatile bool  statusRequested  = false; // LCtrl+LAlt+LShift+PrtSc
 static volatile bool  batteryRequested = false; // LCtrl+LAlt+PrtSc
 static NimBLERemoteCharacteristic* pLedChar  = nullptr;
 static NimBLERemoteCharacteristic* pBatChar  = nullptr;
-static unsigned long  keepaliveAt = 0;
-#define KEEPALIVE_MS  3000
 
 static unsigned long     scanEndAt  = 0;
 static int               scanCount  = 0;
@@ -309,6 +307,8 @@ bool tryConnect(NimBLEAddress addr) {
 
   Serial.printf("[BLE] Connecting to %s ...\n", addr.toString().c_str());
   pClient = NimBLEDevice::createClient();
+  // interval 7.5-15ms, latency=0 (keyboard must respond every event), timeout=32s
+  // latency=0 is critical — prevents keyboard from sleeping between connection events
   pClient->setConnectionParams(6, 12, 0, 3200);
   pClient->setConnectTimeout(12);
 
@@ -372,8 +372,18 @@ bool tryConnect(NimBLEAddress addr) {
         });
     }
   }
-  keepaliveAt = millis() + KEEPALIVE_MS;
 
+  // Log and enforce connection params — keyboard may have renegotiated higher latency
+  {
+    NimBLEConnInfo info = pClient->getConnInfo();
+    Serial.printf("[BLE] Conn interval: %d ms, latency: %d\n",
+                  info.getConnInterval(), info.getConnLatency());
+    if (info.getConnLatency() > 0) {
+      // Force latency=0: keyboard must respond to every connection event
+      pClient->updateConnParams(6, 12, 0, 3200);
+      Serial.println("[BLE] Forcing latency=0 to prevent keyboard sleep");
+    }
+  }
   Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
   return true;
 }
@@ -519,7 +529,6 @@ void handleSerial() {
     prefs.end();
     pLedChar = nullptr;
     pBatChar = nullptr;
-    keepaliveAt = 0;
     NimBLEDevice::deleteAllBonds();
     memset(savedMAC, 0, sizeof(savedMAC));
     memset(prevKeys, 0, 6); prevMod = 0;
@@ -535,7 +544,19 @@ void handleSerial() {
 // ── BLE daemon task ───────────────────────────────────────────────────────────
 void bleDaemonTask(void* arg) {
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(2000)); // check every 2s
+
+    // Keepalive — periodic GATT read to keep keyboard HID layer active
+    if (pClient && pClient->isConnected()) {
+      if (pBatChar) {
+        std::string val = pBatChar->readValue();
+        if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
+      } else if (pLedChar) {
+        uint8_t led = 0;
+        pLedChar->writeValue(&led, 1, false);
+      }
+    }
+
     if (strlen(savedMAC) == 0) continue;
     if (pClient && pClient->isConnected()) continue;
     if (reconnectAt != 0) continue;
@@ -630,14 +651,6 @@ void loop() {
         NimBLEDevice::getScan()->start(5000, false);
       }
     }
-  }
-
-  // Keepalive — periodic battery read prevents keyboard from entering deep sleep
-  if (keepaliveAt && millis() >= keepaliveAt && pBatChar &&
-      pClient && pClient->isConnected()) {
-    keepaliveAt = millis() + KEEPALIVE_MS;
-    std::string val = pBatChar->readValue();
-    if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
   }
 
   // Battery type-out (LCtrl+LAlt+PrtSc)
