@@ -594,7 +594,8 @@ static BLEUUID BATTERY_SERVICE_UUID("0000180f-0000-1000-8000-00805f9b34fb");
 static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
 
 static int8_t         batteryLevel    = -1;  // -1 = unknown
-static volatile bool  statusRequested = false; // set by HID combo, handled in loop()
+static volatile bool  statusRequested  = false; // LCtrl+LAlt+LShift+PrtSc
+static volatile bool  batteryRequested = false; // LCtrl+LAlt+PrtSc
 static NimBLERemoteCharacteristic* pLedChar = nullptr; // HID output report (LED state)
 
 static unsigned long  scanEndAt = 0;
@@ -696,13 +697,15 @@ void processHIDReport(uint8_t* data, size_t len) {
   prevMod = mod;
   memcpy(prevKeys, keys, 6);
 
-  // Ctrl+Alt+PrintScreen → request status type-out
-  // LCtrl=bit0, LAlt=bit2  (or RCtrl=bit4, RAlt=bit6) + PrintScreen=0x46
-  bool ctrl = (mod & 0x01) || (mod & 0x10);
-  bool alt  = (mod & 0x04) || (mod & 0x40);
-  bool prtsc = false;
-  for (int i = 0; i < 6; i++) if (keys[i] == 0x46) { prtsc = true; break; }
-  if (ctrl && alt && prtsc) statusRequested = true;
+  // Hotkey detection — Left modifiers only
+  // LCtrl=bit0  LShift=bit1  LAlt=bit2  PrintScreen=0x46
+  bool lctrl  = (mod & 0x01) != 0;
+  bool lalt   = (mod & 0x04) != 0;
+  bool lshift = (mod & 0x02) != 0;
+  bool prtsc  = false;
+  for (int i = 0; i < 6; i++) if (keys[i] == 0x46 || keys[i] == 0x9A) { prtsc = true; break; }
+  if (lctrl && lalt && lshift && prtsc)  statusRequested  = true;
+  if (lctrl && lalt && !lshift && prtsc) batteryRequested = true;
 
   // Typematic: find first held non-modifier key (skip CapsLock 0x39)
   typematicKey = 0;
@@ -946,6 +949,29 @@ void cmdStatus() {
   Serial.print(buildStatus());
 }
 
+// Type battery percentage via PS/2 (e.g. "78%")
+void typeBatteryViaPS2() {
+  String s = (batteryLevel >= 0) ? (String(batteryLevel) + "%") : "?%";
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+    if (c >= '0' && c <= '9') {
+      uint8_t k = (c == '0') ? 0x27 : 0x1E + (c - '1');
+      keyboard.keyHid_send(k, true);  delay(20);
+      keyboard.keyHid_send(k, false); delay(30);
+    } else if (c == '%') {
+      keyboard.keyHid_send(0xE1, true);
+      keyboard.keyHid_send(0x22, true);  delay(20);
+      keyboard.keyHid_send(0x22, false);
+      keyboard.keyHid_send(0xE1, false); delay(30);
+    } else if (c == '?') {
+      keyboard.keyHid_send(0xE1, true);
+      keyboard.keyHid_send(0x38, true);  delay(20);
+      keyboard.keyHid_send(0x38, false);
+      keyboard.keyHid_send(0xE1, false); delay(30);
+    }
+  }
+}
+
 // Type status text via PS/2 (called from loop() when statusRequested flag is set)
 void typeStatusViaPS2() {
   String s = buildStatus();
@@ -1132,9 +1158,26 @@ void loop() {
     Serial.printf("[LED] BLE LED mask 0x%02X\n", led);
   }
 
-  // Status type-out via PS/2 (triggered by Ctrl+Alt+PrintScreen)
+  // Battery type-out (LCtrl+LAlt+PrtSc)
+  if (batteryRequested) {
+    batteryRequested = false;
+    typematicKey = 0; typematicNext = 0; // stop typematic before typing
+    // Release all held modifiers so they don't interfere with typed output
+    keyboard.keyHid_send(0xE0, false); // LCtrl
+    keyboard.keyHid_send(0xE2, false); // LAlt
+    keyboard.keyHid_send(0xE1, false); // LShift
+    delay(50);
+    typeBatteryViaPS2();
+  }
+
+  // Status type-out (LCtrl+LAlt+LShift+PrtSc)
   if (statusRequested) {
     statusRequested = false;
+    typematicKey = 0; typematicNext = 0;
+    keyboard.keyHid_send(0xE0, false);
+    keyboard.keyHid_send(0xE2, false);
+    keyboard.keyHid_send(0xE1, false);
+    delay(50);
     typeStatusViaPS2();
   }
 

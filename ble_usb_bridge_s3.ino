@@ -65,7 +65,8 @@ static BLEUUID BATTERY_SERVICE_UUID("0000180f-0000-1000-8000-00805f9b34fb");
 static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
 
 static int8_t         batteryLevel    = -1;
-static volatile bool  statusRequested = false;
+static volatile bool  statusRequested  = false; // LCtrl+LAlt+LShift+PrtSc
+static volatile bool  batteryRequested = false; // LCtrl+LAlt+PrtSc
 static NimBLERemoteCharacteristic* pLedChar = nullptr;
 
 static unsigned long     scanEndAt  = 0;
@@ -215,12 +216,15 @@ void processHIDReport(uint8_t* data, size_t len) {
     }
   }
 
-  // Ctrl+Alt+PrintScreen → request status output
-  bool ctrl  = (mod & 0x01) || (mod & 0x10);
-  bool alt   = (mod & 0x04) || (mod & 0x40);
-  bool prtsc = false;
-  for (int i = 0; i < 6; i++) if (keys[i] == 0x46) { prtsc = true; break; }
-  if (ctrl && alt && prtsc) statusRequested = true;
+  // Hotkey detection — Left modifiers only
+  // LCtrl=bit0  LShift=bit1  LAlt=bit2  PrintScreen=0x46
+  bool lctrl  = (mod & 0x01) != 0;
+  bool lalt   = (mod & 0x04) != 0;
+  bool lshift = (mod & 0x02) != 0;
+  bool prtsc  = false;
+  for (int i = 0; i < 6; i++) if (keys[i] == 0x46 || keys[i] == 0x9A) { prtsc = true; break; }
+  if (lctrl && lalt && lshift && prtsc)  statusRequested  = true;
+  if (lctrl && lalt && !lshift && prtsc) batteryRequested = true;
 
   // Typematic — first held key (skip CapsLock 0x39)
   typematicKey = 0;
@@ -398,6 +402,29 @@ String buildStatus() {
   s += String("Bonds:    ") + NimBLEDevice::getNumBonds() + "\n";
   s += "-----------------------------\n";
   return s;
+}
+
+// Type battery percentage via USB HID (e.g. "78%")
+void typeBatteryViaUSB() {
+  hidKb.releaseAll();
+  delay(50);
+  String s = (batteryLevel >= 0) ? (String(batteryLevel) + "%") : "?%";
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s[i];
+    if (c >= '0' && c <= '9') {
+      uint8_t k = (c == '0') ? 0x27 : 0x1E + (c - '1');
+      hidKb.pressRaw(k); delay(20); hidKb.releaseRaw(k); delay(30);
+    } else if (c == '%') {
+      hidKb.pressRaw(0xE1); hidKb.pressRaw(0x22);
+      delay(20);
+      hidKb.releaseRaw(0x22); hidKb.releaseRaw(0xE1); delay(30);
+    } else if (c == '?') {
+      hidKb.pressRaw(0xE1); hidKb.pressRaw(0x38);
+      delay(20);
+      hidKb.releaseRaw(0x38); hidKb.releaseRaw(0xE1); delay(30);
+    }
+  }
+  hidKb.releaseAll();
 }
 
 // Type status via USB HID keyboard (for Ctrl+Alt+PrintScreen in any text field)
@@ -598,9 +625,19 @@ void loop() {
     }
   }
 
-  // Status type-out via USB HID (triggered by Ctrl+Alt+PrintScreen)
+  // Battery type-out (LCtrl+LAlt+PrtSc)
+  if (batteryRequested) {
+    batteryRequested = false;
+    typematicKey = 0; typematicNext = 0;
+    hidKb.releaseAll(); delay(50);
+    typeBatteryViaUSB();
+  }
+
+  // Status type-out (LCtrl+LAlt+LShift+PrtSc)
   if (statusRequested) {
     statusRequested = false;
+    typematicKey = 0; typematicNext = 0;
+    hidKb.releaseAll(); delay(50);
     typeStatusViaUSB();
   }
 
