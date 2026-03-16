@@ -64,7 +64,7 @@ static BLEUUID HID_REPORT_UUID     ("00002a4d-0000-1000-8000-00805f9b34fb");
 static BLEUUID BATTERY_SERVICE_UUID("0000180f-0000-1000-8000-00805f9b34fb");
 static BLEUUID BATTERY_LEVEL_UUID  ("00002a19-0000-1000-8000-00805f9b34fb");
 
-static int8_t         batteryLevel    = -1;
+static int            batteryLevel    = -1;  // -1 = unknown, 0-100 = percent
 static volatile bool  statusRequested  = false; // LCtrl+LAlt+LShift+PrtSc
 static volatile bool  batteryRequested = false; // LCtrl+LAlt+PrtSc
 static NimBLERemoteCharacteristic* pLedChar  = nullptr;
@@ -151,9 +151,18 @@ const char* modName(int bit) {
 
 // ── HID report → USB HID ─────────────────────────────────────────────────────
 void processHIDReport(uint8_t* data, size_t len) {
-  if (len < 3) return;
-  uint8_t  mod  = data[0];
-  uint8_t* keys = data + 2;
+  if (len < 2) return;
+  uint8_t mod = data[0];
+
+  // Auto-detect report format:
+  //   8 bytes: [mod][reserved=0x00][key1..key6]  — standard HID keyboard
+  //   7 bytes: [mod][key1..key6]                 — reserved byte omitted (e.g. esp32_mouse_keyboard)
+  // Heuristic: if len==8 and data[1]==0x00, treat as reserved byte present.
+  // For any other length, assume no reserved byte so keys start at data[1].
+  bool hasReserved = (len == 8 && data[1] == 0x00);
+  uint8_t* keys  = hasReserved ? data + 2 : data + 1;
+  size_t   nkeys = hasReserved ? len - 2  : len - 1;
+  if (nkeys > 6) nkeys = 6;
 
   Serial.print("[HID] ");
   for (size_t i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
@@ -176,7 +185,7 @@ void processHIDReport(uint8_t* data, size_t len) {
   for (int i = 0; i < 6; i++) {
     if (prevKeys[i] == 0 || prevKeys[i] == 0x01) continue;
     bool found = false;
-    for (int j = 0; j < 6; j++) if (keys[j] == prevKeys[i]) { found = true; break; }
+    for (size_t j = 0; j < nkeys; j++) if (keys[j] == prevKeys[i]) { found = true; break; }
     if (!found) {
       Serial.printf("[-] %s\n", hidKeyName(prevKeys[i]));
       usbKeyUp(prevKeys[i]);
@@ -184,7 +193,7 @@ void processHIDReport(uint8_t* data, size_t len) {
   }
 
   // Pressed keys
-  for (int i = 0; i < 6; i++) {
+  for (size_t i = 0; i < nkeys; i++) {
     if (keys[i] == 0 || keys[i] == 0x01) continue;
     bool found = false;
     for (int j = 0; j < 6; j++) if (prevKeys[j] == keys[i]) { found = true; break; }
@@ -195,7 +204,8 @@ void processHIDReport(uint8_t* data, size_t len) {
   }
 
   prevMod = mod;
-  memcpy(prevKeys, keys, 6);
+  memset(prevKeys, 0, 6);
+  memcpy(prevKeys, keys, nkeys);
 
   // Forward LED state to BLE keyboard on lock key press
   // PC sends USB HID output reports but they are not easily interceptable
@@ -207,8 +217,8 @@ void processHIDReport(uint8_t* data, size_t len) {
     for (int k = 0; k < 3; k++) {
       bool isDown  = false;
       bool wasDown = false;
-      for (int i = 0; i < 6; i++) if (keys[i]     == lockKeys[k]) isDown  = true;
-      for (int i = 0; i < 6; i++) if (prevKeys[i] == lockKeys[k]) wasDown = true;
+      for (size_t i = 0; i < nkeys; i++) if (keys[i]     == lockKeys[k]) isDown  = true;
+      for (int    i = 0; i < 6;     i++) if (prevKeys[i] == lockKeys[k]) wasDown = true;
       if (isDown && !wasDown) {  // key just pressed
         bleLedMask ^= ledBits[k];
         if (pLedChar) {
@@ -225,14 +235,14 @@ void processHIDReport(uint8_t* data, size_t len) {
   bool lalt   = (mod & 0x04) != 0;
   bool lshift = (mod & 0x02) != 0;
   bool prtsc  = false;
-  for (int i = 0; i < 6; i++) if (keys[i] == 0x46 || keys[i] == 0x9A) { prtsc = true; break; }
+  for (size_t i = 0; i < nkeys; i++) if (keys[i] == 0x46 || keys[i] == 0x9A) { prtsc = true; break; }
   if (lctrl && lalt && lshift && prtsc)  statusRequested  = true;
   if (lctrl && lalt && !lshift && prtsc) batteryRequested = true;
 
   // Typematic — first held key (skip CapsLock 0x39)
   typematicKey = 0;
   typematicMod = mod;
-  for (int i = 0; i < 6; i++) {
+  for (size_t i = 0; i < nkeys; i++) {
     if (keys[i] && keys[i] != 0x01 && keys[i] != 0x39) {
       typematicKey = keys[i];
       break;
@@ -363,12 +373,12 @@ bool tryConnect(NimBLEAddress addr) {
     if (batChar) {
       if (batChar->canRead()) {
         std::string val = batChar->readValue();
-        if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
+        if (!val.empty()) batteryLevel = (int)(uint8_t)val[0];
         pBatChar = batChar;
       }
       if (batChar->canNotify())
         batChar->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) {
-          if (l > 0) { batteryLevel = d[0]; }
+          if (l > 0) { batteryLevel = (int)d[0]; }
         });
     }
   }
@@ -491,15 +501,18 @@ void handleSerial() {
   } else if (line == "scan") {
     if (scanEndAt) { Serial.println("[SCAN] Already running."); return; }
     if (pClient && pClient->isConnected()) { pClient->disconnect(); delay(100); }
+    NimBLEDevice::getScan()->stop(); delay(100);
     scanCount = 0;
-    NimBLEDevice::getScan()->start(10000, false);
+    NimBLEDevice::getScan()->start(0, false);  // indefinite — stopped by scanEndAt timer
     scanEndAt = millis() + 10000;
-    Serial.println("[SCAN] Scanning 10s...");
+    Serial.println("[SCAN] Scanning 10s — put keyboard into PAIRING MODE");
   } else if (line.startsWith("connect ")) {
     String mac = line.substring(8);
     mac.trim();
     if (mac.length() < 17) { Serial.println("[ERR] Invalid MAC format."); return; }
     if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; }
+    reconnectAt = 0; reconnectFailures = 0;
+    NimBLEDevice::deleteAllBonds();
     NimBLEAddress addr(mac.c_str(), 1);
     bool ok = false;
     for (int i = 0; i < CONNECT_TRIES && !ok; i++) {
@@ -507,7 +520,8 @@ void handleSerial() {
       ok = tryConnect(addr);
     }
     if (ok) {
-      saveKeyboard(addr);
+      // Save address as reported by BLE stack — ensures correct address type for reconnect
+      saveKeyboard(pClient->getPeerAddress());
       Serial.printf("[NVS] Saved: %s\n", savedMAC);
     } else {
       Serial.println("[BLE] Connection failed.");
@@ -577,6 +591,10 @@ void setup() {
   NimBLEDevice::setSecurityAuth(true, false, false);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
   NimBLEDevice::getScan()->setScanCallbacks(new MyScanCallbacks(), false);
+  // Configure scan parameters once globally — applies to all scans including reconnect
+  NimBLEDevice::getScan()->setActiveScan(true);
+  NimBLEDevice::getScan()->setInterval(50);
+  NimBLEDevice::getScan()->setWindow(45);
 
   xTaskCreatePinnedToCore(bleDaemonTask, "ble_daemon", 4096, nullptr, 1, nullptr, 0);
 
@@ -637,7 +655,7 @@ void loop() {
       pClient && pClient->isConnected()) {
     keepaliveAt = millis() + KEEPALIVE_MS;
     std::string val = pBatChar->readValue();
-    if (!val.empty()) batteryLevel = (int8_t)(uint8_t)val[0];
+    if (!val.empty()) batteryLevel = (int)(uint8_t)val[0];
   }
 
   // Battery type-out (LCtrl+LAlt+PrtSc)
