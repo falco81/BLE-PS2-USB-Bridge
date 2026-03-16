@@ -28,6 +28,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 - **NVS storage** — paired keyboard remembered across reboots
 - **Keepalive** — periodic battery level read every 3 s keeps the BLE keyboard awake and prevents the 5–10 s input delay after inactivity
 - **WiFi disabled** — WiFi stack is deinitialised at startup, saving ~20 mA
+- **HID report format auto-detection** — handles both standard 8-byte reports (with reserved byte) and compact 7-byte reports (reserved byte omitted) transparently
 
 ---
 
@@ -161,8 +162,6 @@ connect aa:bb:cc:dd:ee:ff   # connect and save
 
 ### Status output
 
-The `status` command and **Ctrl+Alt+PrintScreen** both produce:
-
 ```
 --- BLE-PS2 Bridge status ---
 BLE:      CONNECTED
@@ -195,34 +194,14 @@ Only **Left** modifier keys are recognised. The bridge releases all held modifie
 ```
 78%
 ```
-If the keyboard does not support battery reporting: `?%`
 
 **LCtrl + LAlt + LShift + PrtSc** example output:
 ```
-
 --- BLE-PS2 Bridge status ---
 BLE:      CONNECTED
 Peer MAC: dc:35:77:e9:cf:a1
 RSSI:     -52 dBm
-Interval: 48 ms
-Encrypt:  yes
-Bonded:   yes
-Battery:  78%
-
-NVS MAC:  dc:35:77:e9:cf:a1
-Bonds:    1
------------------------------
-```
-When disconnected:
-```
-
---- BLE-PS2 Bridge status ---
-BLE:      DISCONNECTED
-Scanning for keyboard...
-Failures: 3
-
-NVS MAC:  dc:35:77:e9:cf:a1
-Bonds:    1
+...
 -----------------------------
 ```
 
@@ -266,6 +245,17 @@ On boot the firmware immediately sends **BAT (Basic Assurance Test) `0xAA`** to 
 | `0xEE` Echo | `0xEE` | |
 | `0xFE` Resend | `0xFA` | |
 | default | `0xFA` | |
+
+### HID report format
+
+BLE HID keyboards send reports in two formats depending on firmware. The bridge auto-detects which format is in use:
+
+| Length | Format | Keys offset |
+|--------|--------|-------------|
+| 8 bytes | `[mod][0x00][key1..key6]` — standard, reserved byte present | `data + 2` |
+| 7 bytes | `[mod][key1..key6]` — compact, reserved byte omitted | `data + 1` |
+
+The heuristic is `len == 8 && data[1] == 0x00` → standard format; otherwise compact. Up to 6 simultaneous keys are processed in both cases.
 
 ### FreeRTOS architecture
 
@@ -331,7 +321,7 @@ MIT
 
 ---
 
-# Variant 2 — BLE → USB HID (ESP32-S3 N16R8)
+# Variant 2 — BLE → USB HID Keyboard (ESP32-S3 N16R8)
 
 BLE keyboard → **USB HID keyboard** using the native USB interface of the ESP32-S3. No level shifter, no PS/2 cable — a single USB-C cable both powers the module and carries HID data.
 
@@ -417,10 +407,14 @@ bleDaemonTask (FreeRTOS, core 0)
 
 Since the BLE HID Usage Table (Keyboard/Keypad, Usage Page 0x07) is identical to USB HID, keycodes are forwarded directly without a translation table.
 
+### HID report format
+
+Same auto-detection as the PS/2 variant — handles both 8-byte (reserved byte present) and 7-byte (reserved byte omitted) keyboard reports transparently. See the [HID report format](#hid-report-format) section above for details.
+
 ### Comparison with PS/2 Variant
 
-| | Variant 1 (PS/2) | Variant 2 (USB) |
-|--|------------------|-----------------|
+| | Variant 1 (PS/2) | Variant 2 (USB keyboard) |
+|--|------------------|--------------------------|
 | Hardware | ESP32-WROOM-32 + level shifter | ESP32-S3 |
 | Output | AT DIN-5 / PS/2 | USB-C HID |
 | Extra components | BSS138 level shifter | None |
@@ -450,9 +444,227 @@ Debug output goes through **UART0** (UART port on the devkit) — independent of
 
 ---
 
+# Variant 3 — BLE → USB HID Keyboard + Mouse (ESP32-S3 N16R8)
+
+BLE keyboard **and** BLE mouse → **USB HID keyboard + mouse** simultaneously, via a single USB-C cable. Both devices connect independently over BLE and are forwarded as standard USB HID. No extra hardware needed.
+
+## Block Diagram
+
+![Block diagram S3 combo](doc/block_diagram_s3_combo.svg)
+
+## Hardware
+
+Same ESP32-S3 N16R8 module as Variant 2. No additional components.
+
+```
+BLE Keyboard ──(BLE 5.0)──┐
+                           ├──► ESP32-S3 ──(USB-C)──► PC
+BLE Mouse    ──(BLE 5.0)──┘     kbd + mouse HID
+```
+
+## Features
+
+- **Two simultaneous BLE connections** — keyboard and mouse connected independently
+- **USB HID keyboard** — full typematic, LED sync, hotkeys (same as Variant 2)
+- **USB HID mouse** — movement, scroll wheel, 5 buttons (Left, Right, Middle, Back, Forward)
+- **Mouse DPI scaling** — configurable divisor to adjust cursor speed for high-DPI mice
+- **Scroll wheel inversion** — toggle with `flipw`
+- **Y-axis inversion** — toggle with `flipy`
+- **Report ID filter** — set a specific BLE Report ID for mice with multiple HID characteristics
+- **Independent auto-reconnect** — each device reconnects separately without affecting the other
+- **NVS storage** — both device MACs and all mouse settings saved across reboots
+- **Battery shortcut** — **LCtrl+LAlt+PrintScreen** types both battery levels: `K: 80% M: 95%`
+- **Status shortcut** — **LCtrl+LAlt+LShift+PrintScreen** types full status for both devices
+
+## Software — `ble_usb_kb_mouse_bridge_s3.ino`
+
+### Arduino IDE Settings
+
+Same as Variant 2:
+
+| Setting | Value |
+|---------|-------|
+| Board | **ESP32S3 Dev Module** |
+| USB Mode | **USB-OTG (TinyUSB)** ← required! |
+| USB CDC On Boot | Disabled |
+| Flash Size | 16MB |
+| PSRAM | OPI PSRAM |
+
+### Required Libraries
+
+| Library | Source |
+|---------|--------|
+| NimBLE-Arduino 2.x | Library Manager |
+| USB.h + USBHIDKeyboard.h + USBHIDMouse.h | included in ESP32 Arduino core 3.x |
+
+### Serial Console Commands
+
+| Command | Description |
+|---------|-------------|
+| `scan` | Scan BLE HID devices 10 s — shows Keyboard / Mouse / type |
+| `connect kb <mac>` | Connect BLE keyboard and save to NVS |
+| `connect mouse <mac>` | Connect BLE mouse and save to NVS |
+| `forget kb` | Forget saved keyboard |
+| `forget mouse` | Forget saved mouse |
+| `forget all` | Forget both devices and reset all settings to defaults |
+| `scale <1-64>` | Mouse movement divisor (default 4) |
+| `flipy` | Toggle mouse Y-axis inversion |
+| `flipw` | Toggle scroll wheel direction |
+| `reportid <0-255>` | Mouse BLE Report ID filter (0 = auto) |
+| `status` | Show connection status and all settings |
+| `help` | Show command list |
+
+### First-time setup
+
+```
+scan
+  #1   aa:bb:cc:dd:ee:ff  Keyboard   -61 dBm  MyKeyboard
+  #2   db:81:f4:bb:6b:5e  Mouse      -55 dBm  MX Master 3
+
+connect kb aa:bb:cc:dd:ee:ff
+connect mouse db:81:f4:bb:6b:5e
+```
+
+Each `connect` command saves the device to NVS. On next boot both devices reconnect automatically.
+
+### Mouse settings
+
+All mouse settings are stored in NVS and survive reboots. `forget all` resets them to defaults.
+
+| Setting | Default | Command |
+|---------|---------|---------|
+| Scale divisor | 4 | `scale <N>` |
+| Y inversion | off | `flipy` |
+| Wheel inversion | off | `flipw` |
+| Report ID filter | 0 (auto) | `reportid <N>` |
+
+**Scale recommendations by DPI:**
+
+| Mouse DPI | Recommended scale |
+|-----------|-------------------|
+| 400 DPI | 1 |
+| 800 DPI | 1–2 |
+| 1600 DPI | 2–4 |
+| 3200 DPI | 4–8 |
+
+### Mouse button mapping
+
+| BLE HID bit | Button | USB HID |
+|-------------|--------|---------|
+| bit 0 | Left | `MOUSE_LEFT` |
+| bit 1 | Right | `MOUSE_RIGHT` |
+| bit 2 | Middle (wheel click) | `MOUSE_MIDDLE` |
+| bit 3 | Back | `MOUSE_BACK` (0x08) |
+| bit 4 | Forward | `MOUSE_FORWARD` (0x10) |
+| bit 5 | Extra / gesture | logged only |
+
+For the Logitech 12-bit packed format (MX Master 2/3, G502, M650) the full 5-button bitmask is read from `byte[0]` of the 7-byte report. The extra byte (`byte[1]`) is mapped to bit 5 and logged but not forwarded to USB — there is no standard 6th mouse button in USB HID.
+
+### BLE HID report parsing
+
+The mouse parser handles all common BLE HID report lengths:
+
+| Length | Format | Notes |
+|--------|--------|-------|
+| 3 B | `[btn][dx8][dy8]` | Standard 3-byte |
+| 4 B | `[btn][dx8][dy8][wheel]` | Standard 4-byte |
+| 5 B | `[btn][dx8][dy8][wheel][hwheel]` | Standard 5-byte |
+| 7 B | Logitech 12-bit packed | MX Master 2/3, G502, M650 — 5 buttons, 12-bit XY |
+
+### Keyboard shortcuts
+
+| Combination | Output |
+|-------------|--------|
+| **LCtrl + LAlt + PrtSc** | Both battery levels, e.g. `K: 80% M: 95%` |
+| **LCtrl + LAlt + LShift + PrtSc** | Full status block for both devices |
+
+### Status output
+
+```
+--- BLE-USB Bridge status ---
+--- Keyboard ---
+BLE:      CONNECTED
+MAC:      aa:bb:cc:dd:ee:ff
+RSSI:     -52 dBm
+Battery:  80%
+
+--- Mouse ---
+BLE:      CONNECTED
+MAC:      db:81:f4:bb:6b:5e
+RSSI:     -55 dBm
+Battery:  95%
+Scale:    1/2
+FlipY:    no
+FlipW:    no
+ReportID: 0 (auto)
+-----------------------------
+```
+
+### Architecture
+
+```
+Core 0                           Core 1 (Arduino loop)
+────────────────────────         ──────────────────────────────────
+BLE stack (NimBLE)               loop()
+  ├─ kbNotifyCallback()            ├─ handleSerial()
+  │    └─ processKbReport()        ├─ keyboard: typematic, hotkeys
+  │         └─ hidKb.pressRaw()    ├─ mouse: processMouseMovement()
+  │                                │    └─ hidMouse.move()
+  └─ mouseNotifyCallback()         │    └─ hidMouse.press/release()
+       └─ portENTER_CRITICAL       ├─ kb/mouse keepalive
+            g_accX/Y/W += delta    ├─ kb/mouse reconnect logic
+            g_buttons = btns       └─ scan end handling
+
+bleDaemonTask (FreeRTOS, core 0, priority 1)
+  check every 3 s
+  → independent reconnect scan for kb and mouse
+```
+
+### NVS keys
+
+| Key | Content |
+|-----|---------|
+| `kb-mac` | Keyboard BLE MAC address |
+| `kb-type` | Keyboard BLE address type |
+| `ms-mac` | Mouse BLE MAC address |
+| `ms-type` | Mouse BLE address type |
+| `ms-scale` | Movement divisor |
+| `ms-flipy` | Y inversion flag |
+| `ms-flipw` | Wheel inversion flag |
+| `ms-rid` | Report ID filter |
+
+### Comparison with other variants
+
+| | Variant 1 (PS/2) | Variant 2 (USB keyboard) | Variant 3 (USB keyboard + mouse) |
+|--|------------------|--------------------------|----------------------------------|
+| Hardware | ESP32-WROOM-32 + level shifter | ESP32-S3 | ESP32-S3 |
+| Output | AT DIN-5 / PS/2 | USB-C keyboard | USB-C keyboard + mouse |
+| BLE devices | 1 (keyboard) | 1 (keyboard) | 2 (keyboard + mouse) |
+| Extra components | BSS138 level shifter | None | None |
+| Compatibility | Retro PC, industrial | Modern PC, Mac, Linux | Modern PC, Mac, Linux |
+| Mouse support | ✗ | ✗ | ✅ 5 buttons + wheel |
+| LED sync | ✅ | ✅ | ✅ |
+| Battery shortcut | `78%` | `78%` | `K: 80% M: 95%` |
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Mouse cursor moves very slowly | Scale too high | Use `scale 1` or `scale 2` |
+| Scroll direction reversed | — | Use `flipw` |
+| Mouse Y axis reversed | — | Use `flipy` |
+| Mouse connects but no movement | Wrong Report ID | Check `[MOUSE]` log lines; try `reportid 17` for MX Master |
+| Back/Forward buttons not working | OS-level mapping missing | Check OS mouse button settings; buttons are correctly forwarded as USB HID bits 3/4 |
+| Only one device reconnects after reboot | Both devices reconnect at slightly different times (staggered by design) | Normal — keyboard at 1.5 s, mouse at 2.0 s after boot |
+| Can't connect second device while first is connecting | BLE scan serialised | Wait for first connection to complete, then connect second |
+
+---
+
+---
+
 # Tools — BT Scanner
 
-`BT_Scanner.ino` scans nearby BLE devices. Use it to find the MAC address of your keyboard before pairing.
+`BT_Scanner.ino` scans nearby BLE devices. Use it to find the MAC address of your keyboard or mouse before pairing.
 
 ## Usage
 
@@ -490,4 +702,3 @@ Devices marked `*** BLE HID KEYBOARD ***` advertise an active HID service (UUID 
 ```
 
 ---
-
