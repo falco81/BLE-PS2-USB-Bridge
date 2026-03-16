@@ -458,7 +458,7 @@ Same ESP32-S3 N16R8 module as Variant 2. No additional components.
 
 ```
 BLE Keyboard ──(BLE 5.0)──┐
-                           ├──► ESP32-S3 ──(USB-C)──► PC
+                          ├──► ESP32-S3 ──(USB-C)──► PC
 BLE Mouse    ──(BLE 5.0)──┘     kbd + mouse HID
 ```
 
