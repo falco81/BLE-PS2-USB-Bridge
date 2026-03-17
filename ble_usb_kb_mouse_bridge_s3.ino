@@ -43,6 +43,7 @@
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDMouse.h"
+#include "USBCDC.h"
 
 // ESP32 Arduino core does not define MOUSE_BACK / MOUSE_FORWARD
 // USBHIDMouse button byte: bit0=L bit1=R bit2=M bit3=Back bit4=Forward
@@ -54,6 +55,12 @@
 #endif
 
 // ── BLE ───────────────────────────────────────────────────────────────────────
+// Increase NimBLE host task stack — combo firmware runs two simultaneous BLE
+// clients (keyboard + mouse) which requires more stack than the default 4096.
+// Without this the host task overflows on Core 0 during NimBLEDevice::init().
+#ifndef CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE
+  #define CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 8192
+#endif
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 
@@ -77,6 +84,63 @@ static BLEUUID RPT_REF_UUID ("00002908-0000-1000-8000-00805f9b34fb");
 // ── USB HID objects ───────────────────────────────────────────────────────────
 static USBHIDKeyboard hidKb;
 static USBHIDMouse    hidMouse;
+static USBCDC         USBSerial;   // CDC console on HID USB port
+
+// ── Console helpers ───────────────────────────────────────────────────────────
+//
+// USBSerial (CDC) requires CRLF line endings — terminals expect \r\n.
+// conPrint/conPrintf translate \n -> \r\n for CDC, send as-is to UART.
+//
+// CDC line editor: character-by-character read with local echo and
+// backspace support so the user sees what they type in PuTTY / any terminal.
+
+static void _usbWrite(const char* s, size_t len) {
+  // Write to CDC, replacing \n with \r\n
+  for (size_t i = 0; i < len; i++) {
+    if (s[i] == '\n') USBSerial.write('\r');
+    USBSerial.write((uint8_t)s[i]);
+  }
+}
+
+static void conPrint(const String& s) {
+  Serial.print(s);
+  if (USBSerial.availableForWrite() > 0) _usbWrite(s.c_str(), s.length());
+}
+static void conPrintf(const char* fmt, ...) {
+  char buf[256];
+  va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+  Serial.print(buf);
+  if (USBSerial.availableForWrite() > 0) _usbWrite(buf, strlen(buf));
+}
+
+// CDC line editor state
+static String _usbLineBuf = "";
+
+// Read one complete line from USBSerial with echo + backspace support.
+// Returns true and sets `line` when Enter is pressed, false otherwise.
+static bool _usbReadLine(String& line) {
+  while (USBSerial.available()) {
+    char c = (char)USBSerial.read();
+    if (c == '\r' || c == '\n') {
+      if (_usbLineBuf.length() > 0) {
+        USBSerial.write("\r\n");   // echo newline
+        line = _usbLineBuf;
+        _usbLineBuf = "";
+        return true;
+      }
+      USBSerial.write("\r\n");
+    } else if (c == 127 || c == '\b') {   // DEL / Backspace
+      if (_usbLineBuf.length() > 0) {
+        _usbLineBuf.remove(_usbLineBuf.length() - 1);
+        USBSerial.write("\b \b");  // erase character on terminal
+      }
+    } else if (c >= 32) {
+      _usbLineBuf += c;
+      USBSerial.write((uint8_t)c);  // local echo
+    }
+  }
+  return false;
+}
 
 // =============================================================================
 //  KEYBOARD — BLE state
@@ -796,78 +860,86 @@ void typeStatusViaUSB() {
 // =============================================================================
 
 void printHelp() {
-  Serial.println("\n========================================");
-  Serial.println("  BLE -> USB HID Keyboard + Mouse Bridge");
-  Serial.println("  ESP32-S3");
-  Serial.println("========================================");
-  Serial.println("  scan                 Scan BLE HID devices (10s)");
-  Serial.println("  connect kb <mac>     Connect BLE keyboard");
-  Serial.println("  connect mouse <mac>  Connect BLE mouse");
-  Serial.println("  forget kb            Forget keyboard");
-  Serial.println("  forget mouse         Forget mouse");
-  Serial.println("  forget all           Forget both + clear settings");
-  Serial.println("  scale <1-64>         Mouse DPI divisor (default 4)");
-  Serial.println("  flipy                Toggle mouse Y inversion");
-  Serial.println("  flipw                Toggle mouse scroll inversion");
-  Serial.println("  reportid <0-255>     Mouse Report ID filter (0=auto)");
-  Serial.println("  status               Show connection status");
-  Serial.println("  help                 Show this list");
-  Serial.println("========================================\n");
+  conPrint("\n========================================\n");
+  conPrint("  BLE -> USB HID Keyboard + Mouse Bridge\n");
+  conPrint("  ESP32-S3\n");
+  conPrint("========================================\n");
+  conPrint("  scan                 Scan BLE HID devices (10s)\n");
+  conPrint("  connect kb <mac>     Connect BLE keyboard\n");
+  conPrint("  connect mouse <mac>  Connect BLE mouse\n");
+  conPrint("  forget kb            Forget keyboard\n");
+  conPrint("  forget mouse         Forget mouse\n");
+  conPrint("  forget all           Forget both + clear settings\n");
+  conPrint("  scale <1-64>         Mouse DPI divisor (default 4)\n");
+  conPrint("  flipy                Toggle mouse Y inversion\n");
+  conPrint("  flipw                Toggle mouse scroll inversion\n");
+  conPrint("  reportid <0-255>     Mouse Report ID filter (0=auto)\n");
+  conPrint("  status               Show connection status\n");
+  conPrint("  help                 Show this list\n");
+  conPrint("  (Commands accepted on both UART and USB CDC)\n");
+  conPrint("========================================\n\n");
 }
 
 void handleSerial() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n'); line.trim();
+  String line;
+  bool got = false;
+  if (Serial.available()) {
+    line = Serial.readStringUntil('\n'); got = true;
+  } else if (_usbReadLine(line)) {
+    got = true;
+  }
+  if (!got) return;
+  line.trim();
   if (!line.length()) return;
 
   if (line == "help") {
     printHelp();
 
   } else if (line == "scan") {
-    if (scanEndAt) { Serial.println("[SCAN] Already running."); return; }
+    if (scanEndAt) { conPrint("[SCAN] Already running." "\n"); return; }
     NimBLEDevice::getScan()->stop(); delay(100);
     scanCount = 0;
     NimBLEDevice::getScan()->start(0, false);
     scanEndAt = millis() + 10000;
-    Serial.println("[SCAN] 10s — HID devices only (put devices into pairing mode)");
-    Serial.println("  #    MAC                Type        RSSI    Name");
-    Serial.println("  ─────────────────────────────────────────────────");
+    conPrint("[SCAN] 10s — HID devices only (put devices into pairing mode)" "\n");
+    conPrint("  #    MAC                Type        RSSI    Name" "\n");
+    conPrint("  ─────────────────────────────────────────────────" "\n");
 
   } else if (line.startsWith("connect kb ")) {
     String mac = line.substring(11); mac.trim();
-    if (mac.length() < 17) { Serial.println("[ERR] connect kb xx:xx:xx:xx:xx:xx"); return; }
+    if (mac.length() < 17) { conPrint("[ERR] connect kb xx:xx:xx:xx:xx:xx" "\n"); return; }
     if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; }
     kbReconnectAt = 0; kbReconnectFails = 0;
     NimBLEDevice::deleteAllBonds();
     bool ok = false;
     NimBLEAddress addr(mac.c_str(), 1);
     for (int i = 0; i < CONNECT_TRIES && !ok; i++) {
-      Serial.printf("[KB] Attempt %d/%d\n", i+1, CONNECT_TRIES);
+      conPrintf("[KB] Attempt %d/%d\n", i+1, CONNECT_TRIES);
       ok = tryConnectKb(addr);
     }
-    if (ok) { saveKb(pClientKb->getPeerAddress()); Serial.printf("[NVS] Keyboard saved: %s\n", kbMAC); }
-    else    { Serial.println("[KB] Connection failed."); }
+    if (ok) { saveKb(pClientKb->getPeerAddress()); conPrintf("[NVS] Keyboard saved: %s\n", kbMAC); }
+    else    { conPrint("[KB] Connection failed." "\n"); }
 
   } else if (line.startsWith("connect mouse ")) {
     String mac = line.substring(14); mac.trim();
-    if (mac.length() < 17) { Serial.println("[ERR] connect mouse xx:xx:xx:xx:xx:xx"); return; }
+    if (mac.length() < 17) { conPrint("[ERR] connect mouse xx:xx:xx:xx:xx:xx" "\n"); return; }
     if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; }
     mouseReconnectAt = 0; mouseReconnectFails = 0;
     bool ok = false;
     NimBLEAddress addr(mac.c_str(), 1);
     for (int i = 0; i < CONNECT_TRIES && !ok; i++) {
-      Serial.printf("[MOUSE] Attempt %d/%d\n", i+1, CONNECT_TRIES);
+      conPrintf("[MOUSE] Attempt %d/%d\n", i+1, CONNECT_TRIES);
       ok = tryConnectMouse(addr);
     }
-    if (ok) { saveMouse(pClientMouse->getPeerAddress()); Serial.printf("[NVS] Mouse saved: %s\n", mouseMAC); saveMouseSettings(); }
-    else    { Serial.println("[MOUSE] Connection failed."); }
+    if (ok) { saveMouse(pClientMouse->getPeerAddress()); conPrintf("[NVS] Mouse saved: %s\n", mouseMAC); saveMouseSettings(); }
+    else    { conPrint("[MOUSE] Connection failed." "\n"); }
 
   } else if (line == "forget kb") {
     if (pClientKb && pClientKb->isConnected()) pClientKb->disconnect();
     prefs.begin(NVS_NS, false); prefs.remove("kb-mac"); prefs.remove("kb-type"); prefs.end();
     memset(kbMAC, 0, sizeof(kbMAC)); kbReconnectAt = 0;
     memset(prevKeys, 0, 6); prevMod = 0; hidKb.releaseAll();
-    Serial.println("[NVS] Keyboard forgotten.");
+    conPrint("[NVS] Keyboard forgotten." "\n");
 
   } else if (line == "forget mouse") {
     if (pClientMouse && pClientMouse->isConnected()) pClientMouse->disconnect();
@@ -875,7 +947,7 @@ void handleSerial() {
     memset(mouseMAC, 0, sizeof(mouseMAC)); mouseReconnectAt = 0;
     portENTER_CRITICAL(&g_mux); g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false; portEXIT_CRITICAL(&g_mux);
     hidMouse.release(MOUSE_LEFT); hidMouse.release(MOUSE_RIGHT); hidMouse.release(MOUSE_MIDDLE); hidMouse.release(MOUSE_BACK); hidMouse.release(MOUSE_FORWARD);
-    Serial.println("[NVS] Mouse forgotten.");
+    conPrint("[NVS] Mouse forgotten." "\n");
 
   } else if (line == "forget all") {
     if (pClientKb    && pClientKb->isConnected())    pClientKb->disconnect();
@@ -888,31 +960,31 @@ void handleSerial() {
     memset(prevKeys, 0, 6); prevMod = 0;
     hidKb.releaseAll();
     hidMouse.release(MOUSE_LEFT); hidMouse.release(MOUSE_RIGHT); hidMouse.release(MOUSE_MIDDLE); hidMouse.release(MOUSE_BACK); hidMouse.release(MOUSE_FORWARD);
-    Serial.println("[NVS] All forgotten — settings reset to defaults.");
+    conPrint("[NVS] All forgotten — settings reset to defaults." "\n");
 
   } else if (line.startsWith("scale ")) {
     int n = line.substring(6).toInt();
-    if (n >= 1 && n <= 64) { g_scaleDivisor = n; saveMouseSettings(); Serial.printf("[CFG] Scale 1/%d saved.\n", n); }
-    else Serial.println("[CFG] scale 1-64");
+    if (n >= 1 && n <= 64) { g_scaleDivisor = n; saveMouseSettings(); conPrintf("[CFG] Scale 1/%d saved.\n", n); }
+    else conPrint("[CFG] scale 1-64" "\n");
 
   } else if (line == "flipy") {
     g_flipY = !g_flipY; saveMouseSettings();
-    Serial.printf("[CFG] FlipY: %s saved.\n", g_flipY ? "ON" : "OFF");
+    conPrintf("[CFG] FlipY: %s saved.\n", g_flipY ? "ON" : "OFF");
 
   } else if (line == "flipw") {
     g_flipW = !g_flipW; saveMouseSettings();
-    Serial.printf("[CFG] FlipW: %s saved.\n", g_flipW ? "ON" : "OFF");
+    conPrintf("[CFG] FlipW: %s saved.\n", g_flipW ? "ON" : "OFF");
 
   } else if (line.startsWith("reportid ")) {
     int n = line.substring(9).toInt();
-    if (n >= 0 && n <= 255) { g_filterReportId = (uint8_t)n; saveMouseSettings(); Serial.printf("[CFG] ReportID %d saved. Reconnect mouse to apply.\n", n); }
-    else Serial.println("[CFG] reportid 0-255");
+    if (n >= 0 && n <= 255) { g_filterReportId = (uint8_t)n; saveMouseSettings(); conPrintf("[CFG] ReportID %d saved. Reconnect mouse to apply.\n", n); }
+    else conPrint("[CFG] reportid 0-255" "\n");
 
   } else if (line == "status") {
-    Serial.print(buildStatus());
+    conPrint(buildStatus());
 
   } else {
-    Serial.printf("[ERR] Unknown: %s\n", line.c_str());
+    conPrintf("[ERR] Unknown: %s\n", line.c_str());
   }
 }
 
@@ -961,20 +1033,14 @@ void bleDaemonTask(void* arg) {
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-
-  // USB HID
-  hidKb.begin();
-  hidMouse.begin();
-  USB.begin();
-  delay(1000);  // wait for USB enumeration
+  delay(200);
 
   Serial.println("\n========================================");
   Serial.println("  BLE -> USB HID Keyboard + Mouse Bridge");
   Serial.println("  ESP32-S3");
   Serial.println("========================================");
 
-  // BLE
+  // ── BLE first — sets up Core 0 NimBLE host task before USB touches Core 0
   NimBLEDevice::init(BRIDGE_NAME);
   NimBLEDevice::setPower(9);
   NimBLEDevice::setSecurityAuth(true, false, false);
@@ -984,7 +1050,22 @@ void setup() {
   NimBLEDevice::getScan()->setInterval(50);
   NimBLEDevice::getScan()->setWindow(45);
 
-  xTaskCreatePinnedToCore(bleDaemonTask, "ble_daemon", 4096, nullptr, 1, nullptr, 0);
+  // Allow BLE host task on Core 0 to fully settle before USB IPC calls start
+  delay(200);
+
+  // ── USB HID + CDC composite — initialise one by one to reduce IPC burst
+  hidKb.begin();
+  delay(50);
+  hidMouse.begin();
+  delay(50);
+  USBSerial.begin();
+  delay(50);
+  USB.begin();
+  delay(1000);  // wait for USB enumeration
+
+  Serial.println("[USB] Enumeration complete.");
+
+  xTaskCreatePinnedToCore(bleDaemonTask, "ble_daemon", 8192, nullptr, 1, nullptr, 0);
 
   // Load saved devices and settings
   loadSavedDevices();
@@ -994,14 +1075,14 @@ void setup() {
     Serial.printf("[NVS] Saved keyboard: %s\n", kbMAC);
     kbReconnectAt = millis() + 1500;
   } else {
-    Serial.println("[NVS] No keyboard. Use: scan → connect kb <mac>");
+    Serial.println("[NVS] No keyboard. Use: scan -> connect kb <mac>");
   }
   if (strlen(mouseMAC)) {
     Serial.printf("[NVS] Saved mouse: %s  scale=1/%d flipy=%s flipw=%s rid=%d\n",
       mouseMAC, (int)g_scaleDivisor, g_flipY?"on":"off", g_flipW?"on":"off", (int)g_filterReportId);
-    mouseReconnectAt = millis() + 2000;  // stagger keyboard and mouse connect
+    mouseReconnectAt = millis() + 2000;
   } else {
-    Serial.println("[NVS] No mouse. Use: scan → connect mouse <mac>");
+    Serial.println("[NVS] No mouse. Use: scan -> connect mouse <mac>");
   }
 
   printHelp();

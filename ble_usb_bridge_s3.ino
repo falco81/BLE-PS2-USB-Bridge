@@ -12,7 +12,7 @@
  *   - Typematic (key repeat while held)
  *   - Auto-reconnect after keyboard disconnect / power cycle
  *   - NVS — paired keyboard remembered across reboots
- *   - Serial console for scan / connect / forget / status
+ *   - Serial console on both UART (CH340) and USB CDC (HID port)
  *
  * ARDUINO IDE SETTINGS:
  *   Board  : ESP32S3 Dev Module
@@ -21,13 +21,19 @@
  *   Port   : COM port ESP32-S3
  *
  * Wiring:
- *   USB-C cable → PC (USB HID output + power)
- *   No level shifter, no extra components.
+ *   USB-C (HID port) → PC  — keyboard HID + CDC console
+ *   USB-C (UART port) → PC — firmware upload + debug output
+ *
+ * Console:
+ *   Commands accepted on UART (115200 baud) AND on USB CDC virtual
+ *   serial port that appears on the HID USB connection.
+ *   Debug output (BLE events, key logs) goes to UART only.
  */
 
 // ── USB HID (native ESP32-S3) ────────────────────────────────────────────────
 #include "USB.h"
 #include "USBHIDKeyboard.h"
+#include "USBCDC.h"
 
 // ── BLE ───────────────────────────────────────────────────────────────────────
 #include <NimBLEDevice.h>
@@ -46,6 +52,64 @@
 
 // ── Global objects ────────────────────────────────────────────────────────────
 static USBHIDKeyboard    hidKb;
+static USBCDC            USBSerial;   // CDC console on HID USB port
+
+// ── Console helpers ───────────────────────────────────────────────────────────
+//
+// USBSerial (CDC) requires CRLF line endings — terminals expect \r\n.
+// conPrint/conPrintf translate \n -> \r\n for CDC, send as-is to UART.
+//
+// CDC line editor: character-by-character read with local echo and
+// backspace support so the user sees what they type in PuTTY / any terminal.
+
+static void _usbWrite(const char* s, size_t len) {
+  // Write to CDC, replacing \n with \r\n
+  for (size_t i = 0; i < len; i++) {
+    if (s[i] == '\n') USBSerial.write('\r');
+    USBSerial.write((uint8_t)s[i]);
+  }
+}
+
+static void conPrint(const String& s) {
+  Serial.print(s);
+  if (USBSerial.availableForWrite() > 0) _usbWrite(s.c_str(), s.length());
+}
+static void conPrintf(const char* fmt, ...) {
+  char buf[256];
+  va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+  Serial.print(buf);
+  if (USBSerial.availableForWrite() > 0) _usbWrite(buf, strlen(buf));
+}
+
+// CDC line editor state
+static String _usbLineBuf = "";
+
+// Read one complete line from USBSerial with echo + backspace support.
+// Returns true and sets `line` when Enter is pressed, false otherwise.
+static bool _usbReadLine(String& line) {
+  while (USBSerial.available()) {
+    char c = (char)USBSerial.read();
+    if (c == '\r' || c == '\n') {
+      if (_usbLineBuf.length() > 0) {
+        USBSerial.write("\r\n");   // echo newline
+        line = _usbLineBuf;
+        _usbLineBuf = "";
+        return true;
+      }
+      // empty line — just echo newline
+      USBSerial.write("\r\n");
+    } else if (c == 127 || c == '\b') {   // DEL / Backspace
+      if (_usbLineBuf.length() > 0) {
+        _usbLineBuf.remove(_usbLineBuf.length() - 1);
+        USBSerial.write("\b \b");  // erase character on terminal
+      }
+    } else if (c >= 32) {
+      _usbLineBuf += c;
+      USBSerial.write((uint8_t)c);  // local echo
+    }
+  }
+  return false;
+}
 
 static NimBLEClient*     pClient           = nullptr;
 static unsigned long     reconnectAt       = 0;
@@ -481,50 +545,57 @@ void typeStatusViaUSB() {
 
 // ── Serial konzole ────────────────────────────────────────────────────────────
 void printHelp() {
-  Serial.println("\n--- Commands ---");
-  Serial.println("  scan          BLE scan (10s)");
-  Serial.println("  connect <mac> Connect and save");
-  Serial.println("  forget        Clear paired keyboard");
-  Serial.println("  status        Connection status");
-  Serial.println("  help          Show this list");
-  Serial.println("---------------");
+  conPrint("\n--- Commands ---\n");
+  conPrint("  scan          BLE scan (10s)\n");
+  conPrint("  connect <mac> Connect and save\n");
+  conPrint("  forget        Clear paired keyboard\n");
+  conPrint("  status        Connection status\n");
+  conPrint("  help          Show this list\n");
+  conPrint("  (Commands accepted on both UART and USB CDC)\n");
+  conPrint("---------------\n");
 }
 
 void handleSerial() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
+  String line;
+  bool got = false;
+
+  if (Serial.available()) {
+    line = Serial.readStringUntil('\n'); got = true;
+  } else if (_usbReadLine(line)) {
+    got = true;
+  }
+  if (!got) return;
   line.trim();
   if (line.length() == 0) return;
 
   if (line == "help") {
     printHelp();
   } else if (line == "scan") {
-    if (scanEndAt) { Serial.println("[SCAN] Already running."); return; }
+    if (scanEndAt) { conPrint("[SCAN] Already running.\n"); return; }
     if (pClient && pClient->isConnected()) { pClient->disconnect(); delay(100); }
     NimBLEDevice::getScan()->stop(); delay(100);
     scanCount = 0;
-    NimBLEDevice::getScan()->start(0, false);  // indefinite — stopped by scanEndAt timer
+    NimBLEDevice::getScan()->start(0, false);
     scanEndAt = millis() + 10000;
-    Serial.println("[SCAN] Scanning 10s — put keyboard into PAIRING MODE");
+    conPrint("[SCAN] Scanning 10s — put keyboard into PAIRING MODE\n");
   } else if (line.startsWith("connect ")) {
     String mac = line.substring(8);
     mac.trim();
-    if (mac.length() < 17) { Serial.println("[ERR] Invalid MAC format."); return; }
+    if (mac.length() < 17) { conPrint("[ERR] Invalid MAC format.\n"); return; }
     if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; }
     reconnectAt = 0; reconnectFailures = 0;
     NimBLEDevice::deleteAllBonds();
     NimBLEAddress addr(mac.c_str(), 1);
     bool ok = false;
     for (int i = 0; i < CONNECT_TRIES && !ok; i++) {
-      Serial.printf("[BLE] Attempt %d/%d\n", i + 1, CONNECT_TRIES);
+      conPrintf("[BLE] Attempt %d/%d\n", i + 1, CONNECT_TRIES);
       ok = tryConnect(addr);
     }
     if (ok) {
-      // Save address as reported by BLE stack — ensures correct address type for reconnect
       saveKeyboard(pClient->getPeerAddress());
-      Serial.printf("[NVS] Saved: %s\n", savedMAC);
+      conPrintf("[NVS] Saved: %s\n", savedMAC);
     } else {
-      Serial.println("[BLE] Connection failed.");
+      conPrint("[BLE] Connection failed.\n");
     }
   } else if (line == "forget") {
     if (pClient && pClient->isConnected()) pClient->disconnect();
@@ -538,11 +609,11 @@ void handleSerial() {
     memset(savedMAC, 0, sizeof(savedMAC));
     memset(prevKeys, 0, 6); prevMod = 0;
     reconnectAt = 0;
-    Serial.println("[NVS] Cleared. Use 'scan' then 'connect <mac>'.");
+    conPrint("[NVS] Cleared. Use 'scan' then 'connect <mac>'.\n");
   } else if (line == "status") {
-    Serial.print(buildStatus());
+    conPrint(buildStatus());
   } else {
-    Serial.printf("[ERR] Unknown command: %s\n", line.c_str());
+    conPrintf("[ERR] Unknown command: %s\n", line.c_str());
   }
 }
 
@@ -574,8 +645,9 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  // USB HID init
+  // USB HID + CDC composite init
   hidKb.begin();
+  USBSerial.begin();   // CDC virtual serial on HID USB port — no boot delay needed
   USB.begin();
 
   delay(1000);  // wait for USB enumeration
