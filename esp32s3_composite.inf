@@ -1,0 +1,24 @@
+[Version]
+Signature="$Windows NT$"
+Class=USB
+ClassGuid={36FC9E60-C465-11CF-8056-444553540000}
+Provider=Espressif
+DriverVer=01/01/2024,1.0.0.0
+
+[Manufacturer]
+%MFGNAME%=DeviceList,NT
+
+[DeviceList.NT]
+%DESCRIPTION%=DriverInstall,USB\VID_303A&PID_1001
+
+[DriverInstall.NT]
+Include=usb.inf
+Needs=Composite.Dev.NT
+
+[DriverInstall.NT.Services]
+Include=usb.inf
+Needs=Composite.Dev.NT.Services
+
+[Strings]
+MFGNAME="Espressif"
+DESCRIPTION="ESP32-S3 USB Composite Device"
