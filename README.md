@@ -431,7 +431,37 @@ Same auto-detection as the PS/2 variant — handles both 8-byte (reserved byte p
 
 ### Serial Console
 
-Debug output goes through **UART0** (UART port on the devkit) — independent of the USB HID port. Commands are the same as in the PS/2 variant: `scan` / `connect <mac>` / `forget` / `status` / `help`.
+Debug output goes through **UART0** (UART port on the devkit) — independent of the USB HID port.
+
+| Command | Description |
+|---------|-------------|
+| `scan` | Scan BLE HID devices 10 s, show MAC / type / RSSI / name |
+| `connect <mac>` | Connect and save — persistent retry until success (max 20 attempts) |
+| `forget` | Clear saved keyboard and all bonds |
+| `status` | Show connection info and settings |
+| `help` | Show command list |
+| `cdc on/off` | Enable / disable USB CDC console (UART only; reboot to apply) |
+
+`connect` retries up to 20 times automatically. Keep the keyboard in pairing mode until `[NVS] Saved` appears. Press any key in the Serial Monitor to abort.
+
+### USB CDC console (optional)
+
+The firmware can present a **virtual serial port** (USB CDC) on the same USB-C HID cable, creating a composite USB device (HID keyboard + CDC serial). This allows configuring the bridge without a separate UART cable.
+
+**Disabled by default.** To enable:
+
+```
+cdc on       ← type in UART Serial Monitor
+             ← reboot — a COM port now appears alongside the HID keyboard
+```
+
+To disable:
+```
+cdc off      ← type in UART Serial Monitor
+             ← reboot
+```
+
+The `cdc on/off` command is **UART-only** — it cannot be issued from the CDC console itself. The setting is saved to NVS and survives reboots. When CDC is disabled, the USB descriptor contains only the HID keyboard interface and no COM port is visible to the OS.
 
 ### Configuration
 
@@ -502,8 +532,8 @@ Same as Variant 2:
 | Command | Description |
 |---------|-------------|
 | `scan` | Scan BLE HID devices 10 s — shows Keyboard / Mouse / type |
-| `connect kb <mac>` | Connect BLE keyboard and save to NVS |
-| `connect mouse <mac>` | Connect BLE mouse and save to NVS |
+| `connect kb <mac>` | Connect BLE keyboard, persistent retry until success, save to NVS |
+| `connect mouse <mac>` | Connect BLE mouse, persistent retry until success, save to NVS |
 | `forget kb` | Forget saved keyboard |
 | `forget mouse` | Forget saved mouse |
 | `forget all` | Forget both devices and reset all settings to defaults |
@@ -513,8 +543,13 @@ Same as Variant 2:
 | `reportid <0-255>` | Mouse BLE Report ID filter (0 = auto) |
 | `status` | Show connection status and all settings |
 | `help` | Show command list |
+| `cdc on/off` | Enable / disable USB CDC console (UART only; reboot to apply) |
+
+`connect kb` and `connect mouse` both retry up to 20 times automatically. Keep each device in pairing mode until saved. Use separate `connect` calls — pairing one device does not affect the other.
 
 ### First-time setup
+
+Put each device into **pairing/discoverable mode** before scanning.
 
 ```
 scan
@@ -606,7 +641,7 @@ ReportID: 0 (auto)
 Core 0                           Core 1 (Arduino loop)
 ────────────────────────         ──────────────────────────────────
 BLE stack (NimBLE)               loop()
-  ├─ kbNotifyCallback()            ├─ handleSerial()
+  ├─ kbNotifyCallback()            ├─ handleSerial() — UART + CDC
   │    └─ processKbReport()        ├─ keyboard: typematic, hotkeys
   │         └─ hidKb.pressRaw()    ├─ mouse: processMouseMovement()
   │                                │    └─ hidMouse.move()
@@ -616,8 +651,32 @@ BLE stack (NimBLE)               loop()
             g_buttons = btns       └─ scan end handling
 
 bleDaemonTask (FreeRTOS, core 0, priority 1)
-  check every 3 s
+  check every 1 s
   → independent reconnect scan for kb and mouse
+  → skipped during manual scan (isManualScan flag)
+
+USB composite device (when CDC enabled):
+  HID keyboard interface  ← hidKb
+  HID mouse interface     ← hidMouse
+  CDC serial interface    ← USBSerial* (nullptr when disabled)
+```
+
+### Boot status
+
+On every boot the firmware prints all stored NVS values before the help text:
+
+```
+[NVS] ========== Stored configuration ==========
+[NVS] Keyboard MAC:  aa:bb:cc:dd:ee:ff
+[NVS] Mouse MAC:     db:81:f4:bb:6b:5e
+[NVS] --- Mouse settings ---
+[NVS] Scale:         1/4
+[NVS] FlipY:         off
+[NVS] FlipW:         off
+[NVS] ReportID:      0 (auto)
+[NVS] --- System ---
+[NVS] CDC:           disabled
+[NVS] ============================================
 ```
 
 ### NVS keys
@@ -632,6 +691,7 @@ bleDaemonTask (FreeRTOS, core 0, priority 1)
 | `ms-flipy` | Y inversion flag |
 | `ms-flipw` | Wheel inversion flag |
 | `ms-rid` | Report ID filter |
+| `cdc-en` | CDC console enabled flag (false by default) |
 
 ### Comparison with other variants
 
@@ -645,6 +705,7 @@ bleDaemonTask (FreeRTOS, core 0, priority 1)
 | Mouse support | ✗ | ✗ | ✅ 5 buttons + wheel |
 | LED sync | ✅ | ✅ | ✅ |
 | Battery shortcut | `78%` | `78%` | `K: 80% M: 95%` |
+| USB CDC console | ✗ | ✅ optional | ✅ optional |
 
 ### Troubleshooting
 
@@ -655,8 +716,165 @@ bleDaemonTask (FreeRTOS, core 0, priority 1)
 | Mouse Y axis reversed | — | Use `flipy` |
 | Mouse connects but no movement | Wrong Report ID | Check `[MOUSE]` log lines; try `reportid 17` for MX Master |
 | Back/Forward buttons not working | OS-level mapping missing | Check OS mouse button settings; buttons are correctly forwarded as USB HID bits 3/4 |
-| Only one device reconnects after reboot | Both devices reconnect at slightly different times (staggered by design) | Normal — keyboard at 1.5 s, mouse at 2.0 s after boot |
+| Only one device reconnects after reboot | Both devices reconnect at slightly different times (staggered by design) | Normal — keyboard attempts at ~500 ms, mouse at ~800 ms after boot |
 | Can't connect second device while first is connecting | BLE scan serialised | Wait for first connection to complete, then connect second |
+
+---
+
+---
+
+---
+
+---
+
+# Tools — Python Configuration Console
+
+`ble_bridge_console.py` is a menu-driven Python console for configuring the ESP32-S3 bridge variants (Variant 2 and Variant 3) via the **USB CDC serial port**. It auto-detects the bridge COM port, provides an interactive menu and streams bridge output in real time with colour-coded log lines.
+
+## Requirements
+
+```
+pip install pyserial
+```
+
+Python 3.7 or later. Works on Windows, macOS and Linux.
+
+## Usage
+
+```
+python ble_bridge_console.py                  # auto-detect port
+python ble_bridge_console.py COM3             # specific port (Windows)
+python ble_bridge_console.py /dev/ttyACM0     # specific port (Linux/macOS)
+python ble_bridge_console.py --list           # list all serial ports
+python ble_bridge_console.py --variant keyboard   # force keyboard-only variant
+python ble_bridge_console.py --variant combo      # force keyboard+mouse variant
+```
+
+### Prerequisites — enable CDC on the bridge first
+
+The Python console requires CDC to be enabled on the bridge. CDC is **disabled by default** to keep the USB descriptor clean. Enable it once via the UART console:
+
+```
+cdc on       ← type in Arduino Serial Monitor (UART port, 115200 baud)
+             ← reboot the ESP32-S3
+             ← a new COM port now appears on the PC
+```
+
+Once CDC is enabled and the bridge is rebooted, `ble_bridge_console.py` can connect to that port.
+
+## Auto-detection
+
+The script scores all serial ports by Espressif VID (`0x303A`) and known ESP32-S3 TinyUSB PIDs. If exactly one strong candidate exists it is selected automatically. If multiple candidates are found an interactive numbered list is shown:
+
+```
+  Likely ESP32-S3 bridge ports:
+  [1]  COM4          ESP32-S3 USB-OTG (TinyUSB)
+
+  Other ports:
+  [2]  COM3          USB Serial Device
+
+  Select port number (or type name, Enter = 1):
+```
+
+The firmware variant (keyboard-only vs keyboard+mouse) is auto-detected from the USB product string. Pass `--variant` to override if needed.
+
+## Main menu
+
+```
+============================================
+  BLE-USB Bridge Console  v1.0
+============================================
+  Port:    COM4
+  Variant: Keyboard + Mouse
+
+  MAIN MENU
+
+  1  Keyboard -- connect / disconnect
+  2  Mouse -- connect / settings
+  3  Show status
+  4  Direct command line
+  5  Help (bridge commands)
+
+  q  Quit
+```
+
+### Menu 1 — Keyboard
+
+```
+  KEYBOARD
+
+  1  Scan for BLE devices
+  2  Connect keyboard  (connect kb)
+  3  Forget keyboard   (forget kb)
+  4  Status
+
+  b  Back
+```
+
+- **Scan** puts the bridge into 10-second BLE scan mode. Put the keyboard into pairing mode before scanning.
+- **Connect** asks for the keyboard MAC address and initiates pairing. The bridge retries automatically — keep the keyboard in pairing mode until `[NVS] Keyboard saved` appears.
+- **Forget** removes the saved keyboard from NVS after confirmation.
+
+### Menu 2 — Mouse (combo variant only)
+
+```
+  MOUSE
+
+  1  Scan for BLE devices
+  2  Connect mouse      (connect mouse)
+  3  Forget mouse       (forget mouse)
+  4  Set scale          (DPI divisor)
+  5  Toggle Y inversion (flipy)
+  6  Toggle scroll inversion (flipw)
+  7  Set Report ID filter
+  8  Status
+
+  b  Back
+```
+
+- **Scale** — movement divisor. Recommended values:
+
+  | Mouse DPI | Scale |
+  |-----------|-------|
+  | 400 DPI | 1 |
+  | 800 DPI | 2 |
+  | 1600 DPI | 4 (default) |
+  | 3200 DPI | 8 |
+
+- **Report ID filter** — normally 0 (auto). Set to `17` for Logitech MX Master 2/3.
+
+### Menu 4 — Direct command line
+
+Raw command prompt that forwards any text directly to the bridge:
+
+```
+  bridge> status
+  bridge> scale 2
+  bridge> reportid 17
+  bridge> exit
+```
+
+Press Enter with no input to send nothing. Type `exit`, `q` or `back` to return to the main menu.
+
+## Output colour coding
+
+Bridge log lines are colour-coded by prefix:
+
+| Prefix | Colour | Meaning |
+|--------|--------|---------|
+| `[BLE]`, `[DAEMON]` | Cyan | BLE connection events |
+| `[SCAN]` | Green | Scan results and found devices |
+| `[NVS]`, `[CFG]` | Yellow | NVS / settings changes |
+| `[ERR]` | Red | Errors |
+| `[KB]`, `[HID]`, `[MOUSE]` | Dim | Key/mouse debug data |
+| `---`, `===` | Bold | Section headers |
+
+## Notes
+
+- The console asserts **DTR** on port open so the firmware's `USBCDC::operator bool()` returns true and CDC output is enabled immediately.
+- On first connection a 150 ms flush is performed to discard garbage bytes that arrive during USB enumeration.
+- Echo suppression: the console suppresses the echoed command line sent back by the firmware, showing only the bridge's actual response.
+- The port is cleanly released on quit or Ctrl+C.
 
 ---
 
