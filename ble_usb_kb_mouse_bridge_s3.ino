@@ -97,8 +97,9 @@ static USBCDC* USBSerial = nullptr;  // CDC -- created only when enabled
 
 static void _usbWrite(const char* s, size_t len) {
   if (!USBSerial) return;
-  // Write to CDC — send \n as-is, terminals handle line endings
+  // CDC terminals (PuTTY, Python pyserial) need \r\n line endings
   for (size_t i = 0; i < len; i++) {
+    if (s[i] == '\n') USBSerial->write('\r');
     USBSerial->write((uint8_t)s[i]);
   }
 }
@@ -989,7 +990,14 @@ void handleSerial() {
   } else if (line == "forget all") {
     if (pClientKb    && pClientKb->isConnected())    pClientKb->disconnect();
     if (pClientMouse && pClientMouse->isConnected()) pClientMouse->disconnect();
-    prefs.begin(NVS_NS, false); prefs.clear(); prefs.end();
+    // Preserve cdc-en — clearing it would disable CDC on next boot
+    // and the user would lose the ability to configure the bridge via USB
+    prefs.begin(NVS_NS, false);
+    prefs.remove("kb-mac");  prefs.remove("kb-type");
+    prefs.remove("ms-mac");  prefs.remove("ms-type");
+    prefs.remove("ms-scale"); prefs.remove("ms-flipy");
+    prefs.remove("ms-flipw"); prefs.remove("ms-rid");
+    prefs.end();
     NimBLEDevice::deleteAllBonds();
     memset(kbMAC, 0, sizeof(kbMAC)); memset(mouseMAC, 0, sizeof(mouseMAC));
     kbReconnectAt = mouseReconnectAt = 0;
@@ -997,7 +1005,8 @@ void handleSerial() {
     memset(prevKeys, 0, 6); prevMod = 0;
     hidKb.releaseAll();
     hidMouse.release(MOUSE_LEFT); hidMouse.release(MOUSE_RIGHT); hidMouse.release(MOUSE_MIDDLE); hidMouse.release(MOUSE_BACK); hidMouse.release(MOUSE_FORWARD);
-    conPrint("[NVS] All forgotten — settings reset to defaults." "\n");
+    conPrintf("[NVS] All forgotten — settings reset to defaults. CDC: %s\n",
+              g_cdcEnabled ? "preserved (enabled)" : "preserved (disabled)");
 
   } else if (line.startsWith("scale ")) {
     int n = line.substring(6).toInt();

@@ -64,8 +64,9 @@ static USBCDC* USBSerial = nullptr;  // CDC -- created only when enabled
 
 static void _usbWrite(const char* s, size_t len) {
   if (!USBSerial) return;
-  // Write to CDC — send \n as-is, terminals handle line endings
+  // CDC terminals (PuTTY, Python pyserial) need \r\n line endings
   for (size_t i = 0; i < len; i++) {
+    if (s[i] == '\n') USBSerial->write('\r');
     USBSerial->write((uint8_t)s[i]);
   }
 }
@@ -614,8 +615,9 @@ void handleSerial() {
     }
   } else if (line == "forget") {
     if (pClient && pClient->isConnected()) pClient->disconnect();
+    // Preserve cdc-en — clearing it would disable CDC on next boot
     prefs.begin(NVS_NS, false);
-    prefs.clear();
+    prefs.remove("mac"); prefs.remove("type");
     prefs.end();
     pLedChar = nullptr;
     pBatChar = nullptr;
@@ -624,7 +626,8 @@ void handleSerial() {
     memset(savedMAC, 0, sizeof(savedMAC));
     memset(prevKeys, 0, 6); prevMod = 0;
     reconnectAt = 0;
-    conPrint("[NVS] Cleared. Use 'scan' then 'connect <mac>'.\n");
+    conPrintf("[NVS] Cleared. CDC: %s\n",
+              g_cdcEnabled ? "preserved (enabled)" : "preserved (disabled)");
   } else if (line == "status") {
     conPrint(buildStatus());
   } else if (line == "cdc on" || line == "cdc off") {
