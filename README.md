@@ -463,6 +463,45 @@ cdc off      ← type in UART Serial Monitor
 
 The `cdc on/off` command is **UART-only** — it cannot be issued from the CDC console itself. The setting is saved to NVS and survives reboots. When CDC is disabled, the USB descriptor contains only the HID keyboard interface and no COM port is visible to the OS.
 
+#### Windows XP CDC driver
+
+Windows XP does not include a CDC driver for composite USB devices — it requires a `.inf` file to install `usbser.sys` for the CDC interface. Two INF files are included in the project:
+
+| File | Purpose |
+|------|---------|
+| `esp32s3_composite.inf` | Installs USB Composite Device driver (`usbccgp.sys`) for the parent device |
+| `esp32s3_cdc.inf` | Installs USB Serial driver (`usbser.sys`) for the CDC interface |
+
+**Installation procedure on Windows XP:**
+
+1. Enable CDC on the bridge and reboot (`cdc on` via UART, then power-cycle)
+2. Connect the USB-C HID+CDC cable to the XP PC
+3. The New Hardware Wizard appears — **cancel it** (do not let Windows search online)
+4. Open **Device Manager** — you will see a yellow question mark
+
+**Step A — check if composite device was recognised automatically:**
+
+- If Device Manager shows **ESP32-S3 USB OTG** with a yellow `!` *and* a separate **TinyUSB CDC** entry → XP already loaded `usbccgp.sys` automatically. Skip to Step B.
+- If only a single yellow `?` appears with Hardware ID `USB\VID_303A&PID_1001` → install `esp32s3_composite.inf` first:
+  - Right-click the unknown device → **Update Driver** → Install from specific location → point to the folder containing `esp32s3_composite.inf`
+  - Confirm the unsigned driver warning
+  - Device Manager should now show the CDC interface separately
+
+**Step B — install CDC serial driver:**
+
+- Right-click **ESP32-S3 USB OTG** (Hardware ID `USB\VID_303A&PID_1001&MI_01`) → **Update Driver**
+- Install from specific location → point to the folder containing `esp32s3_cdc.inf`
+- Confirm the unsigned driver warning
+- The device now appears as **COM port** (e.g. COM3) under Ports in Device Manager
+
+**Notes:**
+
+- The VID (`303A`) and PID (`1001`) are fixed in the ESP32 Arduino core and are the same on every ESP32-S3 board — the INF files work on any XP PC without modification
+- The CDC interface is on **MI_01** in the composite descriptor (HID keyboard = MI_00, CDC = MI_01)
+- On Windows 7 and later, `usbser.sys` loads automatically — no INF file needed
+- If the driver installation fails, try a different USB port; XP caches device information per port
+
+
 ### Configuration
 
 ```cpp
