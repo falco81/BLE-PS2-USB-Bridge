@@ -147,8 +147,11 @@ class BridgeConsole:
             dsrdtr   = False,
         )
         # Assert DTR so firmware's USBCDC::operator bool() returns true.
-        # Without this the firmware's conPrint() guard blocks CDC output.
         self.ser.dtr = True
+        # Wait for firmware flush (it discards garbage on DTR assert)
+        # then flush our own RX buffer before starting the reader thread
+        time.sleep(0.15)
+        self.ser.reset_input_buffer()
         self._stop.clear()
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
@@ -185,6 +188,9 @@ class BridgeConsole:
                         line, buf = buf.split(b"\n", 1)
                         decoded = line.decode("utf-8", errors="replace").rstrip()
                         if not decoded:
+                            continue
+                        # Discard lines that are mostly replacement chars (garbage from enumeration)
+                        if decoded.count("\ufffd") > len(decoded) // 2:
                             continue
                         # Suppress firmware echo of the last sent command
                         if self._echo_filter and decoded.strip().lower() == self._echo_filter:

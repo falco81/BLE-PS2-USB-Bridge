@@ -62,6 +62,7 @@
   #define CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 8192
 #endif
 #include <NimBLEDevice.h>
+#include <set>
 #include <Preferences.h>
 
 // ── Konfigurace ───────────────────────────────────────────────────────────────
@@ -84,7 +85,7 @@ static BLEUUID RPT_REF_UUID ("00002908-0000-1000-8000-00805f9b34fb");
 // ── USB HID objects ───────────────────────────────────────────────────────────
 static USBHIDKeyboard hidKb;
 static USBHIDMouse    hidMouse;
-static USBCDC         USBSerial;   // CDC console on HID USB port
+static USBCDC* USBSerial = nullptr;  // CDC -- created only when enabled
 
 // ── Console helpers ───────────────────────────────────────────────────────────
 //
@@ -95,48 +96,49 @@ static USBCDC         USBSerial;   // CDC console on HID USB port
 // backspace support so the user sees what they type in PuTTY / any terminal.
 
 static void _usbWrite(const char* s, size_t len) {
-  // Write to CDC, replacing \n with \r\n
+  if (!USBSerial) return;
+  // Write to CDC — send \n as-is, terminals handle line endings
   for (size_t i = 0; i < len; i++) {
-    if (s[i] == '\n') USBSerial.write('\r');
-    USBSerial.write((uint8_t)s[i]);
+    USBSerial->write((uint8_t)s[i]);
   }
 }
 
 static void conPrint(const String& s) {
   Serial.print(s);
-  if (USBSerial.availableForWrite() > 0) _usbWrite(s.c_str(), s.length());
+  if (USBSerial && USBSerial->availableForWrite() > 0) _usbWrite(s.c_str(), s.length());
 }
 static void conPrintf(const char* fmt, ...) {
   char buf[256];
   va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
   Serial.print(buf);
-  if (USBSerial.availableForWrite() > 0) _usbWrite(buf, strlen(buf));
+  if (USBSerial && USBSerial->availableForWrite() > 0) _usbWrite(buf, strlen(buf));
 }
 
 // CDC line editor state
 static String _usbLineBuf = "";
+static bool   _usbWasConnected = false;  // track CDC connect state for flush
 
 // Read one complete line from USBSerial with echo + backspace support.
 // Returns true and sets `line` when Enter is pressed, false otherwise.
 static bool _usbReadLine(String& line) {
-  while (USBSerial.available()) {
-    char c = (char)USBSerial.read();
+  while (USBSerial->available()) {
+    char c = (char)USBSerial->read();
     if (c == '\r' || c == '\n') {
       if (_usbLineBuf.length() > 0) {
-        USBSerial.write("\r\n");   // echo newline
+        USBSerial->write("\r\n");   // echo newline
         line = _usbLineBuf;
         _usbLineBuf = "";
         return true;
       }
-      USBSerial.write("\r\n");
+      USBSerial->write("\r\n");
     } else if (c == 127 || c == '\b') {   // DEL / Backspace
       if (_usbLineBuf.length() > 0) {
         _usbLineBuf.remove(_usbLineBuf.length() - 1);
-        USBSerial.write("\b \b");  // erase character on terminal
+        USBSerial->write("\b \b");  // erase character on terminal
       }
     } else if (c >= 32) {
       _usbLineBuf += c;
-      USBSerial.write((uint8_t)c);  // local echo
+      USBSerial->write((uint8_t)c);  // local echo
     }
   }
   return false;
@@ -217,11 +219,14 @@ static int32_t  g_dbgX = 0, g_dbgY = 0, g_dbgW = 0;
 static uint32_t g_dbgPkts = 0;
 
 // Scan
-static int           scanCount = 0;
-static unsigned long scanEndAt = 0;
+static int           scanCount    = 0;
+static unsigned long scanEndAt    = 0;
+static volatile bool isManualScan = false;  // true = user-initiated scan vs reconnect scan
+static std::set<std::string> scanSeen;          // dedup MAC addresses during manual scan
 
 // Preferences
 static Preferences prefs;
+static bool g_cdcEnabled = false;  // USB CDC -- default off, saved to NVS
 
 // =============================================================================
 //  KEYBOARD — USB HID helpers
@@ -280,9 +285,9 @@ void processKbReport(uint8_t* data, size_t len) {
   size_t   nkeys = hasReserved ? len - 2  : len - 1;
   if (nkeys > 6) nkeys = 6;
 
-  Serial.print("[KB] ");
-  for (size_t i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
-  Serial.println();
+  conPrint("[KB] ");
+  for (size_t i = 0; i < len; i++) conPrintf("%02X ", data[i]);
+  conPrint("\n");
 
   if (mod != prevMod) {
     usbApplyModifiers(mod);
@@ -546,14 +551,14 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     std::string addr = dev->getAddress().toString();
     // Reconnect detection for keyboard
     if (kbReconnectScan && strlen(kbMAC) && addr == std::string(kbMAC)) {
-      Serial.println("[SCAN] Keyboard found — connecting...");
+      conPrint("[SCAN] Keyboard found — connecting..." "\n");
       NimBLEDevice::getScan()->stop();
       kbReconnectScan = false;
       kbReconnectAt   = millis() + 50;
     }
     // Reconnect detection for mouse
     if (mouseReconnectScan && strlen(mouseMAC) && addr == std::string(mouseMAC)) {
-      Serial.println("[SCAN] Mouse found — connecting...");
+      conPrint("[SCAN] Mouse found — connecting..." "\n");
       NimBLEDevice::getScan()->stop();
       mouseReconnectScan = false;
       mouseReconnectAt   = millis() + 50;
@@ -561,19 +566,24 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
   }
 
   void onResult(const NimBLEAdvertisedDevice* dev) override {
-    if (kbReconnectScan || mouseReconnectScan) return;
+    if (!isManualScan) return;  // only print during user-initiated scan
     if (!dev->haveServiceUUID() || !dev->isAdvertisingService(HID_SVC_UUID)) return;
+    std::string addr = dev->getAddress().toString();
+    if (scanSeen.count(addr)) return;  // already listed
+    scanSeen.insert(addr);
     const char* app  = dev->haveAppearance() ? bleAppName(dev->getAppearance()) : "HID";
-    const char* name = (dev->haveName() && dev->getName().length()) ? dev->getName().c_str() : "-";
-    Serial.printf("  #%-2d  %-17s  %-10s  %4d dBm  %s\n",
-      scanCount+1, dev->getAddress().toString().c_str(), app, dev->getRSSI(), name);
+    // Store name in local string — getName() may return a temporary, c_str() on a
+    // temporary is a dangling pointer by the time conPrintf uses it
+    std::string nameStr = (dev->haveName() && dev->getName().length()) ? dev->getName() : "-";
+    conPrintf("  #%-2d  %-17s  %-10s  %4d dBm  %s\n",
+      scanCount+1, addr.c_str(), app, dev->getRSSI(), nameStr.c_str());
     scanCount++;
   }
 
   void onScanEnd(const NimBLEScanResults&, int) override {
     // If a reconnect scan ended without finding the device, retry after delay
-    if (kbReconnectScan)    { kbReconnectScan    = false; kbReconnectAt    = millis() + 500; }
-    if (mouseReconnectScan) { mouseReconnectScan = false; mouseReconnectAt = millis() + 500; }
+    if (kbReconnectScan)    { kbReconnectScan    = false; kbReconnectAt    = millis() + 200; }
+    if (mouseReconnectScan) { mouseReconnectScan = false; mouseReconnectAt = millis() + 200; }
   }
 };
 
@@ -588,7 +598,7 @@ bool tryConnectKb(NimBLEAddress addr) {
     pClientKb = nullptr;
     delay(200);
   }
-  Serial.printf("[KB] Connecting to %s ...\n", addr.toString().c_str());
+  conPrintf("[KB] Connecting to %s ...\n", addr.toString().c_str());
   pClientKb = NimBLEDevice::createClient();
   pClientKb->setConnectionParams(6, 12, 0, 3200);
   pClientKb->setConnectTimeout(12);
@@ -597,7 +607,7 @@ bool tryConnectKb(NimBLEAddress addr) {
     NimBLEDevice::deleteClient(pClientKb); pClientKb = nullptr;
     return false;
   }
-  if (pClientKb->secureConnection()) Serial.println("[KB] Bonding OK");
+  if (pClientKb->secureConnection()) conPrint("[KB] Bonding OK" "\n");
 
   NimBLERemoteService* svc = pClientKb->getService(HID_SVC_UUID);
   if (!svc) {
@@ -637,7 +647,7 @@ bool tryConnectKb(NimBLEAddress addr) {
     }
   }
   kbKeepaliveAt = millis() + KEEPALIVE_MS;
-  Serial.printf("[KB] Connected — %d char(s), battery %d%%\n", subs, kbBattery);
+  conPrintf("[KB] Connected — %d char(s), battery %d%%\n", subs, kbBattery);
   memset(prevKeys, 0, 6); prevMod = 0;
   return true;
 }
@@ -653,7 +663,7 @@ bool tryConnectMouse(NimBLEAddress addr) {
     pClientMouse = nullptr;
     delay(200);
   }
-  Serial.printf("[MOUSE] Connecting to %s ...\n", addr.toString().c_str());
+  conPrintf("[MOUSE] Connecting to %s ...\n", addr.toString().c_str());
   pClientMouse = NimBLEDevice::createClient();
   pClientMouse->setConnectionParams(6, 12, 0, 3200);
   pClientMouse->setConnectTimeout(12);
@@ -662,7 +672,7 @@ bool tryConnectMouse(NimBLEAddress addr) {
     NimBLEDevice::deleteClient(pClientMouse); pClientMouse = nullptr;
     return false;
   }
-  if (pClientMouse->secureConnection()) Serial.println("[MOUSE] Bonding OK");
+  if (pClientMouse->secureConnection()) conPrint("[MOUSE] Bonding OK" "\n");
 
   NimBLERemoteService* svc = pClientMouse->getService(HID_SVC_UUID);
   if (!svc) {
@@ -686,7 +696,7 @@ bool tryConnectMouse(NimBLEAddress addr) {
     }
     bool skip = (rptType != 1) || (rptId == 0) ||
                 (g_filterReportId && rptId != g_filterReportId);
-    Serial.printf("[MOUSE] handle=0x%04X  ID=%-3d  Type=%d  %s\n",
+    conPrintf("[MOUSE] handle=0x%04X  ID=%-3d  Type=%d  %s\n",
       c->getHandle(), rptId, rptType, skip ? "skip" : "SUBSCRIBE");
     if (skip) continue;
     c->subscribe(true, mouseNotifyCallback); subs++;
@@ -696,7 +706,7 @@ bool tryConnectMouse(NimBLEAddress addr) {
 
   // Fallback if all filtered out
   if (!subs) {
-    Serial.println("[MOUSE] Fallback: subscribing all notifiable chars");
+    conPrint("[MOUSE] Fallback: subscribing all notifiable chars" "\n");
     for (NimBLERemoteCharacteristic* c : chars) {
       if (!c->canNotify()) continue;
       c->subscribe(true, mouseNotifyCallback); subs++;
@@ -732,7 +742,7 @@ bool tryConnectMouse(NimBLEAddress addr) {
   portEXIT_CRITICAL(&g_mux);
   g_prevButtons = 0;
 
-  Serial.printf("[MOUSE] Connected — %d char(s), battery %d%%\n", subs, mouseBattery);
+  conPrintf("[MOUSE] Connected — %d char(s), battery %d%%\n", subs, mouseBattery);
   return true;
 }
 
@@ -876,16 +886,18 @@ void printHelp() {
   conPrint("  reportid <0-255>     Mouse Report ID filter (0=auto)\n");
   conPrint("  status               Show connection status\n");
   conPrint("  help                 Show this list\n");
-  conPrint("  (Commands accepted on both UART and USB CDC)\n");
+  Serial.println("  cdc on/off           Enable/disable USB CDC (UART only)\n"
+                 "                       Reboot required to apply.");
   conPrint("========================================\n\n");
 }
 
 void handleSerial() {
   String line;
   bool got = false;
+  bool uart_cmd = false;  // true = command came from UART
   if (Serial.available()) {
-    line = Serial.readStringUntil('\n'); got = true;
-  } else if (_usbReadLine(line)) {
+    line = Serial.readStringUntil('\n'); got = true; uart_cmd = true;
+  } else if (g_cdcEnabled && _usbReadLine(line)) {
     got = true;
   }
   if (!got) return;
@@ -896,43 +908,68 @@ void handleSerial() {
     printHelp();
 
   } else if (line == "scan") {
-    if (scanEndAt) { conPrint("[SCAN] Already running." "\n"); return; }
+    if (scanEndAt) { conPrint("[SCAN] Already running.\n"); return; }
     NimBLEDevice::getScan()->stop(); delay(100);
+    // Suspend reconnect scans during manual scan — onResult filters them out otherwise
+    kbReconnectScan    = false;
+    mouseReconnectScan = false;
+    isManualScan = true;
     scanCount = 0;
+    scanSeen.clear();
     NimBLEDevice::getScan()->start(0, false);
     scanEndAt = millis() + 10000;
-    conPrint("[SCAN] 10s — HID devices only (put devices into pairing mode)" "\n");
-    conPrint("  #    MAC                Type        RSSI    Name" "\n");
-    conPrint("  ─────────────────────────────────────────────────" "\n");
+    conPrint("[SCAN] 10s — HID devices only (put devices into pairing mode)\n");
+    conPrint("  #    MAC                Type        RSSI    Name\n");
+    conPrint("  -------------------------------------------------\n");
 
   } else if (line.startsWith("connect kb ")) {
     String mac = line.substring(11); mac.trim();
     if (mac.length() < 17) { conPrint("[ERR] connect kb xx:xx:xx:xx:xx:xx" "\n"); return; }
-    if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; }
+    if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; isManualScan = false; }
     kbReconnectAt = 0; kbReconnectFails = 0;
-    NimBLEDevice::deleteAllBonds();
+    { NimBLEAddress a(mac.c_str(), 1); NimBLEDevice::deleteBond(a); }
+    delay(100);
     bool ok = false;
     NimBLEAddress addr(mac.c_str(), 1);
     for (int i = 0; i < CONNECT_TRIES && !ok; i++) {
       conPrintf("[KB] Attempt %d/%d\n", i+1, CONNECT_TRIES);
       ok = tryConnectKb(addr);
+      if (!ok && i < CONNECT_TRIES - 1) delay(1500);
     }
     if (ok) { saveKb(pClientKb->getPeerAddress()); conPrintf("[NVS] Keyboard saved: %s\n", kbMAC); }
-    else    { conPrint("[KB] Connection failed." "\n"); }
+    else    { conPrint("[KB] Connection failed.\n"); }
 
   } else if (line.startsWith("connect mouse ")) {
     String mac = line.substring(14); mac.trim();
-    if (mac.length() < 17) { conPrint("[ERR] connect mouse xx:xx:xx:xx:xx:xx" "\n"); return; }
-    if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; }
+    if (mac.length() < 17) { conPrint("[ERR] connect mouse xx:xx:xx:xx:xx:xx\n"); return; }
+    if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt = 0; isManualScan = false; }
     mouseReconnectAt = 0; mouseReconnectFails = 0;
-    bool ok = false;
+    // Delete only this device bond — not all bonds (would disconnect keyboard)
+    { NimBLEAddress a(mac.c_str(), 1); NimBLEDevice::deleteBond(a); }
+    delay(100);
     NimBLEAddress addr(mac.c_str(), 1);
-    for (int i = 0; i < CONNECT_TRIES && !ok; i++) {
-      conPrintf("[MOUSE] Attempt %d/%d\n", i+1, CONNECT_TRIES);
+    bool ok = false;
+    int attempt = 0;
+    // Keep retrying — mouse may take a few seconds to enter pairing mode
+    // Each connect() attempt has a 12s timeout internally
+    conPrint("[MOUSE] Connecting — keep mouse in pairing mode...\n");
+    while (!ok) {
+      attempt++;
+      conPrintf("[MOUSE] Attempt %d\n", attempt);
       ok = tryConnectMouse(addr);
+      if (!ok) {
+        if (attempt >= 20) {
+          conPrint("[MOUSE] Giving up after 20 attempts. Try: connect mouse <mac> again.\n");
+          mouseReconnectAt = millis() + 10000;
+          break;
+        }
+        // Check if any serial command arrived (user wants to abort)
+        if (Serial.available()) { Serial.readStringUntil('\n'); conPrint("[MOUSE] Aborted.\n"); break; }
+        if (g_cdcEnabled && USBSerial && USBSerial->available()) { _usbLineBuf = ""; while(USBSerial->available()) USBSerial->read(); conPrint("[MOUSE] Aborted.\n"); break; }
+        delay(500);
+      }
     }
     if (ok) { saveMouse(pClientMouse->getPeerAddress()); conPrintf("[NVS] Mouse saved: %s\n", mouseMAC); saveMouseSettings(); }
-    else    { conPrint("[MOUSE] Connection failed." "\n"); }
 
   } else if (line == "forget kb") {
     if (pClientKb && pClientKb->isConnected()) pClientKb->disconnect();
@@ -983,6 +1020,19 @@ void handleSerial() {
   } else if (line == "status") {
     conPrint(buildStatus());
 
+  } else if (line == "cdc on" || line == "cdc off") {
+    if (!uart_cmd) {
+      conPrint("[ERR] cdc command only available on UART console.\n");
+      return;
+    }
+    bool enable = (line == "cdc on");
+    Preferences p; p.begin(NVS_NS, false);
+    p.putBool("cdc-en", enable);
+    p.end();
+    // Do NOT update g_cdcEnabled at runtime -- USB descriptor is fixed at boot
+    // The change takes effect after reboot
+    Serial.printf("[CDC] USB serial %s -- saved. Reboot to apply.\n",
+                  enable ? "ENABLED" : "DISABLED");
   } else {
     conPrintf("[ERR] Unknown: %s\n", line.c_str());
   }
@@ -994,34 +1044,34 @@ void handleSerial() {
 
 void bleDaemonTask(void* arg) {
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // Keyboard reconnect
-    if (strlen(kbMAC) && !(pClientKb && pClientKb->isConnected()) && !kbReconnectAt) {
-      Serial.println("[DAEMON] Keyboard lost — scheduling reconnect...");
+    // Keyboard reconnect — skip if manual scan is in progress
+    if (!isManualScan && strlen(kbMAC) && !(pClientKb && pClientKb->isConnected()) && !kbReconnectAt) {
+      conPrint("[DAEMON] Keyboard lost — scheduling reconnect...\n");
       memset(prevKeys, 0, 6); prevMod = 0; typematicKey = 0; typematicArmed = false;
       hidKb.releaseAll();
       if (!kbReconnectScan && !mouseReconnectScan) {
         kbReconnectScan = true;
-        NimBLEDevice::getScan()->start(5000, false);
-        Serial.println("[SCAN] Waiting for keyboard...");
+        NimBLEDevice::getScan()->start(3000, false);
+        conPrint("[SCAN] Waiting for keyboard...\n");
       } else {
-        kbReconnectAt = millis() + 5000;  // retry later if scan already running
+        kbReconnectAt = millis() + 2000;
       }
     }
 
-    // Mouse reconnect
-    if (strlen(mouseMAC) && !(pClientMouse && pClientMouse->isConnected()) && !mouseReconnectAt) {
-      Serial.println("[DAEMON] Mouse lost — scheduling reconnect...");
+    // Mouse reconnect — skip if manual scan is in progress
+    if (!isManualScan && strlen(mouseMAC) && !(pClientMouse && pClientMouse->isConnected()) && !mouseReconnectAt) {
+      conPrint("[DAEMON] Mouse lost — scheduling reconnect...\n");
       portENTER_CRITICAL(&g_mux); g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false; portEXIT_CRITICAL(&g_mux);
       g_prevButtons = 0;
       hidMouse.release(MOUSE_LEFT); hidMouse.release(MOUSE_RIGHT); hidMouse.release(MOUSE_MIDDLE); hidMouse.release(MOUSE_BACK); hidMouse.release(MOUSE_FORWARD);
       if (!kbReconnectScan && !mouseReconnectScan) {
         mouseReconnectScan = true;
-        NimBLEDevice::getScan()->start(5000, false);
-        Serial.println("[SCAN] Waiting for mouse...");
+        NimBLEDevice::getScan()->start(3000, false);
+        conPrint("[SCAN] Waiting for mouse...\n");
       } else {
-        mouseReconnectAt = millis() + 5000;
+        mouseReconnectAt = millis() + 2000;
       }
     }
   }
@@ -1053,13 +1103,24 @@ void setup() {
   // Allow BLE host task on Core 0 to fully settle before USB IPC calls start
   delay(200);
 
+  // Read NVS first so we know whether to register CDC in USB descriptor
+  {
+    Preferences p; p.begin(NVS_NS, true);
+    g_cdcEnabled = p.getBool("cdc-en", false);
+    p.end();
+  }
+
   // ── USB HID + CDC composite — initialise one by one to reduce IPC burst
+  // CDC must be registered BEFORE USB.begin() — the descriptor is fixed at that point
   hidKb.begin();
   delay(50);
   hidMouse.begin();
   delay(50);
-  USBSerial.begin();
-  delay(50);
+  if (g_cdcEnabled) {
+    USBSerial = new USBCDC();
+    USBSerial->begin();
+    delay(50);
+  }
   USB.begin();
   delay(1000);  // wait for USB enumeration
 
@@ -1071,19 +1132,22 @@ void setup() {
   loadSavedDevices();
   loadMouseSettings();
 
-  if (strlen(kbMAC)) {
-    Serial.printf("[NVS] Saved keyboard: %s\n", kbMAC);
-    kbReconnectAt = millis() + 1500;
-  } else {
-    Serial.println("[NVS] No keyboard. Use: scan -> connect kb <mac>");
-  }
-  if (strlen(mouseMAC)) {
-    Serial.printf("[NVS] Saved mouse: %s  scale=1/%d flipy=%s flipw=%s rid=%d\n",
-      mouseMAC, (int)g_scaleDivisor, g_flipY?"on":"off", g_flipW?"on":"off", (int)g_filterReportId);
-    mouseReconnectAt = millis() + 2000;
-  } else {
-    Serial.println("[NVS] No mouse. Use: scan -> connect mouse <mac>");
-  }
+  Serial.println("[NVS] ========== Stored configuration ==========");
+  Serial.printf( "[NVS] Keyboard MAC:  %s\n",  strlen(kbMAC)    ? kbMAC    : "(none)");
+  Serial.printf( "[NVS] Mouse MAC:     %s\n",  strlen(mouseMAC) ? mouseMAC : "(none)");
+  Serial.println("[NVS] --- Mouse settings ---");
+  Serial.printf( "[NVS] Scale:         1/%d\n", (int)g_scaleDivisor);
+  Serial.printf( "[NVS] FlipY:         %s\n",   g_flipY ? "on" : "off");
+  Serial.printf( "[NVS] FlipW:         %s\n",   g_flipW ? "on" : "off");
+  Serial.printf( "[NVS] ReportID:      %d%s\n", (int)g_filterReportId,
+                  g_filterReportId ? "" : " (auto)");
+  Serial.println("[NVS] --- System ---");
+  Serial.printf( "[NVS] CDC:           %s\n",   g_cdcEnabled ? "enabled" : "disabled");
+  Serial.println("[NVS] ============================================");
+  if (strlen(kbMAC))    kbReconnectAt    = millis() + 500;
+  if (strlen(mouseMAC)) mouseReconnectAt = millis() + 800;
+  if (g_cdcEnabled) Serial.println("[CDC] USB serial enabled.");
+  else              Serial.println("[CDC] USB serial disabled. Use 'cdc on' to enable.");
 
   printHelp();
 }
@@ -1097,29 +1161,30 @@ void loop() {
 
   // ── Scan end ─────────────────────────────────────────────────────────────
   if (scanEndAt && millis() >= scanEndAt) {
-    scanEndAt = 0;
+    scanEndAt    = 0;
+    isManualScan = false;
     NimBLEDevice::getScan()->stop();
-    Serial.printf("[SCAN] Done — %d device(s).\n", scanCount);
+    conPrintf("[SCAN] Done — %d device(s). Use: connect kb/mouse <mac>\n", scanCount);
   }
 
   // ── Keyboard disconnection ───────────────────────────────────────────────
   if (pClientKb && !pClientKb->isConnected() && strlen(kbMAC) && !kbReconnectAt) {
-    Serial.println("[KB] Disconnected.");
+    conPrint("[KB] Disconnected." "\n");
     NimBLEDevice::deleteClient(pClientKb); pClientKb = nullptr;
     memset(prevKeys, 0, 6); prevMod = 0; hidKb.releaseAll();
     kbReconnectFails = 0; kbReconnectScan = true;
-    NimBLEDevice::getScan()->start(5000, false);
+    NimBLEDevice::getScan()->start(3000, false);
   }
 
   // ── Mouse disconnection ──────────────────────────────────────────────────
   if (pClientMouse && !pClientMouse->isConnected() && strlen(mouseMAC) && !mouseReconnectAt) {
-    Serial.println("[MOUSE] Disconnected.");
+    conPrint("[MOUSE] Disconnected." "\n");
     NimBLEDevice::deleteClient(pClientMouse); pClientMouse = nullptr;
     portENTER_CRITICAL(&g_mux); g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false; portEXIT_CRITICAL(&g_mux);
     g_prevButtons = 0;
     hidMouse.release(MOUSE_LEFT); hidMouse.release(MOUSE_RIGHT); hidMouse.release(MOUSE_MIDDLE); hidMouse.release(MOUSE_BACK); hidMouse.release(MOUSE_FORWARD);
     mouseReconnectFails = 0; mouseReconnectScan = true;
-    NimBLEDevice::getScan()->start(5000, false);
+    NimBLEDevice::getScan()->start(3000, false);
   }
 
   // ── Keyboard reconnect ───────────────────────────────────────────────────
@@ -1130,9 +1195,9 @@ void loop() {
       if (tryConnectKb(NimBLEAddress(kbMAC, kbType))) {
         kbReconnectFails = 0;
       } else {
-        Serial.printf("[KB] Connect failed (%dx)\n", ++kbReconnectFails);
+        conPrintf("[KB] Connect failed (%dx)\n", ++kbReconnectFails);
         kbReconnectScan = true;
-        NimBLEDevice::getScan()->start(5000, false);
+        NimBLEDevice::getScan()->start(3000, false);
       }
     }
   }
@@ -1145,9 +1210,9 @@ void loop() {
       if (tryConnectMouse(NimBLEAddress(mouseMAC, mouseType))) {
         mouseReconnectFails = 0;
       } else {
-        Serial.printf("[MOUSE] Connect failed (%dx)\n", ++mouseReconnectFails);
+        conPrintf("[MOUSE] Connect failed (%dx)\n", ++mouseReconnectFails);
         mouseReconnectScan = true;
-        NimBLEDevice::getScan()->start(5000, false);
+        NimBLEDevice::getScan()->start(3000, false);
       }
     }
   }

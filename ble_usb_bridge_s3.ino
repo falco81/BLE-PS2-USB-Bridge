@@ -52,7 +52,7 @@
 
 // ── Global objects ────────────────────────────────────────────────────────────
 static USBHIDKeyboard    hidKb;
-static USBCDC            USBSerial;   // CDC console on HID USB port
+static USBCDC* USBSerial = nullptr;  // CDC -- created only when enabled
 
 // ── Console helpers ───────────────────────────────────────────────────────────
 //
@@ -63,49 +63,62 @@ static USBCDC            USBSerial;   // CDC console on HID USB port
 // backspace support so the user sees what they type in PuTTY / any terminal.
 
 static void _usbWrite(const char* s, size_t len) {
-  // Write to CDC, replacing \n with \r\n
+  if (!USBSerial) return;
+  // Write to CDC — send \n as-is, terminals handle line endings
   for (size_t i = 0; i < len; i++) {
-    if (s[i] == '\n') USBSerial.write('\r');
-    USBSerial.write((uint8_t)s[i]);
+    USBSerial->write((uint8_t)s[i]);
   }
 }
 
 static void conPrint(const String& s) {
   Serial.print(s);
-  if (USBSerial.availableForWrite() > 0) _usbWrite(s.c_str(), s.length());
+  if (USBSerial && USBSerial->availableForWrite() > 0) _usbWrite(s.c_str(), s.length());
 }
 static void conPrintf(const char* fmt, ...) {
   char buf[256];
   va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
   Serial.print(buf);
-  if (USBSerial.availableForWrite() > 0) _usbWrite(buf, strlen(buf));
+  if (USBSerial && USBSerial->availableForWrite() > 0) _usbWrite(buf, strlen(buf));
 }
 
 // CDC line editor state
 static String _usbLineBuf = "";
+static bool   _usbWasConnected = false;  // track CDC connect state for flush
 
 // Read one complete line from USBSerial with echo + backspace support.
 // Returns true and sets `line` when Enter is pressed, false otherwise.
 static bool _usbReadLine(String& line) {
-  while (USBSerial.available()) {
-    char c = (char)USBSerial.read();
+  if (!USBSerial) return false;
+  // Flush RX buffer on new CDC connection (DTR assertion sends garbage)
+  bool connected = (bool)(*USBSerial);
+  if (connected && !_usbWasConnected) {
+    delay(50);
+    while (USBSerial->available()) USBSerial->read();  // discard garbage
+    _usbLineBuf = "";
+    _usbWasConnected = true;
+  } else if (!connected) {
+    _usbWasConnected = false;
+    _usbLineBuf = "";
+  }
+  while (USBSerial->available()) {
+    char c = (char)USBSerial->read();
     if (c == '\r' || c == '\n') {
       if (_usbLineBuf.length() > 0) {
-        USBSerial.write("\r\n");   // echo newline
+        USBSerial->write("\r\n");   // echo newline
         line = _usbLineBuf;
         _usbLineBuf = "";
         return true;
       }
       // empty line — just echo newline
-      USBSerial.write("\r\n");
+      USBSerial->write("\r\n");
     } else if (c == 127 || c == '\b') {   // DEL / Backspace
       if (_usbLineBuf.length() > 0) {
         _usbLineBuf.remove(_usbLineBuf.length() - 1);
-        USBSerial.write("\b \b");  // erase character on terminal
+        USBSerial->write("\b \b");  // erase character on terminal
       }
     } else if (c >= 32) {
       _usbLineBuf += c;
-      USBSerial.write((uint8_t)c);  // local echo
+      USBSerial->write((uint8_t)c);  // local echo
     }
   }
   return false;
@@ -117,6 +130,7 @@ static int               reconnectFailures   = 0;
 static bool              reconnectScanActive = false;
 
 static Preferences       prefs;
+static bool g_cdcEnabled = false;  // USB CDC -- default off, saved to NVS
 static char              savedMAC[18]      = "";
 static uint8_t           savedType         = 1;
 
@@ -228,9 +242,9 @@ void processHIDReport(uint8_t* data, size_t len) {
   size_t   nkeys = hasReserved ? len - 2  : len - 1;
   if (nkeys > 6) nkeys = 6;
 
-  Serial.print("[HID] ");
-  for (size_t i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
-  Serial.println();
+  conPrint("[HID] ");
+  for (size_t i = 0; i < len; i++) conPrintf("%02X ", data[i]);
+  conPrint("\n");
 
   // Modifiers — apply full bitmask at once
   if (mod != prevMod) {
@@ -240,8 +254,8 @@ void processHIDReport(uint8_t* data, size_t len) {
       uint8_t mask = 1 << bit;
       bool was = (prevMod & mask) != 0;
       bool is  = (mod     & mask) != 0;
-      if (is  && !was) Serial.printf("[+] %s\n", modName(bit));
-      if (!is &&  was) Serial.printf("[-] %s\n", modName(bit));
+      if (is  && !was) conPrintf("[+] %s\n", modName(bit));
+      if (!is &&  was) conPrintf("[-] %s\n", modName(bit));
     }
   }
 
@@ -251,7 +265,7 @@ void processHIDReport(uint8_t* data, size_t len) {
     bool found = false;
     for (size_t j = 0; j < nkeys; j++) if (keys[j] == prevKeys[i]) { found = true; break; }
     if (!found) {
-      Serial.printf("[-] %s\n", hidKeyName(prevKeys[i]));
+      conPrintf("[-] %s\n", hidKeyName(prevKeys[i]));
       usbKeyUp(prevKeys[i]);
     }
   }
@@ -262,7 +276,7 @@ void processHIDReport(uint8_t* data, size_t len) {
     bool found = false;
     for (int j = 0; j < 6; j++) if (prevKeys[j] == keys[i]) { found = true; break; }
     if (!found) {
-      Serial.printf("[+] %s\n", hidKeyName(keys[i]));
+      conPrintf("[+] %s\n", hidKeyName(keys[i]));
       usbKeyDown(keys[i]);
     }
   }
@@ -332,7 +346,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     // Reconnect scan: detect saved keyboard
     if (reconnectScanActive && strlen(savedMAC) > 0) {
       if (dev->getAddress().toString() == std::string(savedMAC)) {
-        Serial.println("[SCAN] Keyboard found — connecting...");
+        conPrint("[SCAN] Keyboard found — connecting..." "\n");
         NimBLEDevice::getScan()->stop();
         reconnectScanActive = false;
         reconnectAt = millis() + 50;
@@ -341,7 +355,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     }
     // Manual scan: print named devices
     if (!dev->haveName() || dev->getName().length() == 0) return;
-    Serial.printf("  %-30s  %s\n",
+    conPrintf("  %-30s  %s\n",
       dev->getName().c_str(), dev->getAddress().toString().c_str());
     scanCount++;
   }
@@ -381,22 +395,22 @@ bool tryConnect(NimBLEAddress addr) {
     delay(200);
   }
 
-  Serial.printf("[BLE] Connecting to %s ...\n", addr.toString().c_str());
+  conPrintf("[BLE] Connecting to %s ...\n", addr.toString().c_str());
   pClient = NimBLEDevice::createClient();
   pClient->setConnectionParams(6, 12, 0, 3200);
   pClient->setConnectTimeout(12);
 
   if (!pClient->connect(addr)) {
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
-    Serial.println("[BLE] Connection failed.");
+    conPrint("[BLE] Connection failed." "\n");
     return false;
   }
 
-  if (pClient->secureConnection()) Serial.println("[BLE] Bonding OK");
+  if (pClient->secureConnection()) conPrint("[BLE] Bonding OK" "\n");
 
   NimBLERemoteService* svc = pClient->getService(HID_SERVICE_UUID);
   if (!svc) {
-    Serial.println("[BLE] HID service not found.");
+    conPrint("[BLE] HID service not found." "\n");
     pClient->disconnect();
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
     return false;
@@ -427,7 +441,7 @@ bool tryConnect(NimBLEAddress addr) {
       break;
     }
   }
-  if (pLedChar) Serial.println("[BLE] LED output char found");
+  if (pLedChar) conPrint("[BLE] LED output char found" "\n");
 
   // Battery level
   batteryLevel = -1;
@@ -448,7 +462,7 @@ bool tryConnect(NimBLEAddress addr) {
   }
   keepaliveAt = millis() + KEEPALIVE_MS;
 
-  Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
+  conPrintf("[BLE] Bridge active — %d HID report(s)\n", subs);
   return true;
 }
 
@@ -551,17 +565,18 @@ void printHelp() {
   conPrint("  forget        Clear paired keyboard\n");
   conPrint("  status        Connection status\n");
   conPrint("  help          Show this list\n");
-  conPrint("  (Commands accepted on both UART and USB CDC)\n");
+  Serial.println("  cdc on/off    Enable/disable USB CDC (UART only)\n"                 "  Reboot required to apply.");
   conPrint("---------------\n");
 }
 
 void handleSerial() {
   String line;
   bool got = false;
+  bool uart_cmd = false;  // true = command came from UART
 
   if (Serial.available()) {
-    line = Serial.readStringUntil('\n'); got = true;
-  } else if (_usbReadLine(line)) {
+    line = Serial.readStringUntil('\n'); got = true; uart_cmd = true;
+  } else if (g_cdcEnabled && _usbReadLine(line)) {
     got = true;
   }
   if (!got) return;
@@ -612,6 +627,18 @@ void handleSerial() {
     conPrint("[NVS] Cleared. Use 'scan' then 'connect <mac>'.\n");
   } else if (line == "status") {
     conPrint(buildStatus());
+  } else if (line == "cdc on" || line == "cdc off") {
+    if (!uart_cmd) {
+      conPrint("[ERR] cdc command only available on UART console.\n");
+      return;
+    }
+    bool enable = (line == "cdc on");
+    Preferences p; p.begin(NVS_NS, false);
+    p.putBool("cdc-en", enable);
+    p.end();
+    g_cdcEnabled = enable;
+    Serial.printf("[CDC] USB serial %s -- saved. Reboot to apply.\n",
+                  enable ? "ENABLED" : "DISABLED");
   } else {
     conPrintf("[ERR] Unknown command: %s\n", line.c_str());
   }
@@ -624,7 +651,7 @@ void bleDaemonTask(void* arg) {
     if (strlen(savedMAC) == 0) continue;
     if (pClient && pClient->isConnected()) continue;
     if (reconnectAt != 0) continue;
-    Serial.println("[DAEMON] Keyboard lost, scheduling reconnect...");
+    conPrint("[DAEMON] Keyboard lost, scheduling reconnect..." "\n");
     memset(prevKeys, 0, 6);
     prevMod        = 0;
     typematicKey   = 0;
@@ -634,7 +661,7 @@ void bleDaemonTask(void* arg) {
     if (!reconnectScanActive) {
       reconnectScanActive = true;
       NimBLEDevice::getScan()->start(5000, false);
-      Serial.println("[SCAN] Waiting for keyboard to advertise...");
+      conPrint("[SCAN] Waiting for keyboard to advertise..." "\n");
     }
   }
 }
@@ -645,9 +672,20 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  // Read NVS first so we know whether to register CDC in USB descriptor
+  {
+    Preferences p; p.begin(NVS_NS, true);
+    g_cdcEnabled = p.getBool("cdc-en", false);
+    p.end();
+  }
+
   // USB HID + CDC composite init
+  // CDC must be registered BEFORE USB.begin() — the descriptor is fixed at that point
   hidKb.begin();
-  USBSerial.begin();   // CDC virtual serial on HID USB port — no boot delay needed
+  if (g_cdcEnabled) {
+    USBSerial = new USBCDC();
+    USBSerial->begin();
+  }
   USB.begin();
 
   delay(1000);  // wait for USB enumeration
@@ -670,12 +708,15 @@ void setup() {
 
   xTaskCreatePinnedToCore(bleDaemonTask, "ble_daemon", 4096, nullptr, 1, nullptr, 0);
 
-  if (loadSavedKeyboard()) {
-    Serial.printf("[NVS] Saved keyboard: %s\n", savedMAC);
-    reconnectAt = millis() + 1500;  // slightly longer wait — USB needs time
-  } else {
-    Serial.println("[NVS] No keyboard saved. Use 'scan' then 'connect <mac>'.");
-  }
+  loadSavedKeyboard();
+  Serial.println("[NVS] ========== Stored configuration ==========");
+  Serial.printf( "[NVS] Keyboard MAC:  %s\n", strlen(savedMAC) ? savedMAC : "(none)");
+  Serial.println("[NVS] --- System ---");
+  Serial.printf( "[NVS] CDC:           %s\n", g_cdcEnabled ? "enabled" : "disabled");
+  Serial.println("[NVS] ============================================");
+  if (strlen(savedMAC)) reconnectAt = millis() + 1500;
+  if (g_cdcEnabled) Serial.println("[CDC] USB serial enabled.");
+  else              Serial.println("[CDC] USB serial disabled. Use 'cdc on' to enable.");
   printHelp();
 }
 
@@ -688,21 +729,21 @@ void loop() {
     scanEndAt = 0;
     NimBLEDevice::getScan()->stop();
     if (scanCount == 0)
-      Serial.println("[SCAN] No devices found. Try again.");
+      conPrint("[SCAN] No devices found. Try again." "\n");
     else
-      Serial.printf("[SCAN] Done — %d devices. Use: connect <mac>\n", scanCount);
+      conPrintf("[SCAN] Done — %d devices. Use: connect <mac>\n", scanCount);
   }
 
   // Disconnection detection
   if (pClient && !pClient->isConnected() && strlen(savedMAC) > 0 && reconnectAt == 0) {
-    Serial.println("[BLE] Keyboard disconnected.");
+    conPrint("[BLE] Keyboard disconnected." "\n");
     NimBLEDevice::deleteClient(pClient); pClient = nullptr;
     memset(prevKeys, 0, 6); prevMod = 0;
     hidKb.releaseAll();
     reconnectFailures = 0;
     reconnectScanActive = true;
     NimBLEDevice::getScan()->start(5000, false);
-    Serial.println("[SCAN] Waiting for keyboard to advertise...");
+    conPrint("[SCAN] Waiting for keyboard to advertise..." "\n");
   }
 
   // Reconnect — triggered by scan callback when keyboard is seen
@@ -715,7 +756,7 @@ void loop() {
         reconnectFailures = 0;
       } else {
         reconnectFailures++;
-        Serial.printf("[BLE] Connect failed (%dx) — scanning again...\n", reconnectFailures);
+        conPrintf("[BLE] Connect failed (%dx) — scanning again...\n", reconnectFailures);
         reconnectScanActive = true;
         NimBLEDevice::getScan()->start(5000, false);
       }
