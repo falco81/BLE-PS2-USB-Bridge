@@ -232,7 +232,7 @@ When the keyboard disconnects, the firmware starts a BLE scan and waits for the 
 
 ### Startup sequence
 
-On boot the firmware immediately sends **BAT (Basic Assurance Test) `0xAA`** to the PC before BLE initialises. BIOS waits up to ~500 ms for this byte.
+On boot the firmware calls `keyboard.begin()` as the very first action in `setup()` — before `Serial.begin()`, before WiFi deinit, before anything else. This ensures **BAT (Basic Assurance Test) `0xAA`** reaches the PC within ~200 ms of power-on. BIOS waits up to ~500 ms for this byte; the previous order (`Serial.begin` + `delay(200)` + WiFi deinit first) consumed ~400 ms before BAT was sent, causing rare `Keyboard error` failures on slow boots.
 
 ### Host command handling
 
@@ -304,7 +304,7 @@ The send task runs on **Core 0 at priority 15**. This is deliberate: `ps2_write(
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| *Keyboard error or not present* | BAT not received in time | Check level shifter wiring, 5 V present on HV side |
+| *Keyboard error or not present* | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` is the first call in `setup()`, BAT arrives ~200 ms after reset. If it still occurs, check level shifter wiring and 5 V on HV side |
 | BIOS OK but OS fails | Supervision timeout during POST | Already fixed — supervision = 32 s |
 | Keys not repeating | — | Typematic implemented in firmware |
 | Wrong keys | Wrong pin assignment | DIN-5: pin1=CLK, pin2=DATA. Mini-DIN 6: pin5=CLK, pin1=DATA |
@@ -1099,8 +1099,8 @@ Both send tasks run on **Core 0 at priority 15**. `ps2_write()` uses `taskENTER_
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| PC shows keyboard error at POST | BAT not received in time | Check level shifter wiring on keyboard port; 5 V on HV side |
-| Mouse not detected at boot | Mouse BAT/ID not received | Check level shifter wiring on mouse port |
+| PC shows keyboard error at POST | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` is the first call in `setup()`, BAT arrives ~200 ms after reset. If it still occurs, check level shifter wiring on keyboard port; 5 V on HV side |
+| Mouse not detected at boot | Mouse BAT/ID not received | `mouse.begin()` also called before Serial/WiFi init. Check level shifter wiring on mouse port |
 | Wrong key output | Wrong pin assignment | Verify GPIO19=CLK, GPIO18=DATA for keyboard |
 | Mouse cursor erratic | Scale too low | Try `scale 4` or `scale 8` |
 | Scroll direction reversed | — | Use `flipw` |
