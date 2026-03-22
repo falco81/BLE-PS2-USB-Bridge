@@ -15,8 +15,8 @@ static volatile uint8_t pendingLedMask = 0xFF;
 // ── Timing constants (from reference project) ────────────────────────────────
 #define PS2KB_CLK_HALF_US        40    // half clock period µs (spec: 30-50)
 #define PS2KB_CLK_QUARTER_US     20
-#define PS2KB_BYTE_INTERVAL_US  500    // gap between bytes
-#define PS2KB_HOST_POLL_MS        9    // how often to check for host commands
+#define PS2KB_BYTE_INTERVAL_US   500   // gap between bytes
+#define PS2KB_HOST_POLL_MS        2    // how often to check for host commands
 #define PS2KB_PACKET_QUEUE_LEN   20
 
 // ── Scan code set 2 — make/break tables ──────────────────────────────────────
@@ -70,7 +70,7 @@ public:
   enum class BusState { IDLE, INHIBITED, HOST_REQUEST_TO_SEND };
   BusState get_bus_state();
   int  ps2_write(uint8_t data);
-  int  ps2_write_wait_idle(uint8_t data, uint64_t timeout_us = 1500);
+  int  ps2_write_wait_idle(uint8_t data, uint64_t timeout_us = 100000);
   int  ps2_read(uint8_t *data, uint64_t timeout_ms = 0);
   void reply_to_host(uint8_t cmd);
   int  send_packet(PS2Packet *pkt);
@@ -104,6 +104,8 @@ void ps2kb_task_send(void *arg);
 // ── Scan code tables (set 2) ──────────────────────────────────────────────────
 // Only MAKE (press) and BREAK (release) — indexed by PS2Key enum
 
+// Scan Code Set 2 — sent to 8042 which translates to Set 1 for the CPU.
+// Correct for all standard AT/PS2 machines.
 static const uint8_t MAKE[][9] = {
   {1,0x1C},{1,0x32},{1,0x21},{1,0x23},{1,0x24},{1,0x2B},{1,0x34},{1,0x33}, // A-H
   {1,0x43},{1,0x3B},{1,0x42},{1,0x4B},{1,0x3A},{1,0x31},{1,0x44},{1,0x4D}, // I-P
@@ -111,7 +113,7 @@ static const uint8_t MAKE[][9] = {
   {1,0x35},{1,0x1A},                                                          // Y-Z
   {1,0x45},{1,0x16},{1,0x1E},{1,0x26},{1,0x25},{1,0x2E},{1,0x36},{1,0x3D}, // 0-7
   {1,0x3E},{1,0x46},                                                          // 8-9
-  {1,0x0E},{1,0x4E},{1,0x55},{1,0x5D},{1,0x66},{1,0x29},                   // ` - . BKSP SPC
+  {1,0x0E},{1,0x4E},{1,0x55},{1,0x5D},{1,0x66},{1,0x29},                   // ` - = \ BKSP SPC
   {1,0x0D},{1,0x58},                                                          // TAB CAPS
   {1,0x12},{1,0x14},{2,0xE0,0x1F},{1,0x11},                                 // LSHIFT LCTRL LSUPER LALT
   {1,0x59},{2,0xE0,0x14},{2,0xE0,0x27},{2,0xE0,0x11},{2,0xE0,0x2F},       // RSHIFT RCTRL RSUPER RALT MENU
@@ -212,9 +214,14 @@ int PS2Keyboard::ps2_write(uint8_t data) {
 }
 
 int PS2Keyboard::ps2_write_wait_idle(uint8_t data, uint64_t timeout_us) {
+  // Always wait up to 100ms — 8042 can inhibit clock while waiting for the
+  // CPU to read port 0x60. A slow IRQ1 handler (e.g. Tyrian, Duke3D) can
+  // keep clock inhibited for several ms. If we give up too soon and drop a
+  // byte, multi-byte scan codes (E0 + code) become corrupted and the 8042
+  // stalls indefinitely waiting for the missing byte.
   uint64_t start = ps2_micros();
   while (get_bus_state() != BusState::IDLE) {
-    if (ps2_micros() - start > timeout_us) return -1;
+    if (ps2_micros() - start > 100000ULL) return -1; // 100ms hard limit
   }
   return ps2_write(data);
 }
@@ -387,8 +394,9 @@ void PS2Keyboard::begin() {
 
   // Core 0 — same as reference project (BLE/Bluetooth also on core 0; that's fine,
   // scheduler handles it; reference project runs kb tasks on APP_CPU = core 0 by default)
-  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2host", 4096, this, 10, &_task_host, 0);
-  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2send", 4096, this,  9, &_task_send, 0);
+  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2host", 4096, this,  8, &_task_host, 0);
+  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2send", 4096, this, 15, &_task_send, 1);  // ps2send pinned to Core 1 at highest priority — scan codes must arrive without jitter
+  // ps2host on Core 0, lower priority — host commands (LED, reset) are rare
 
   Serial.println("[PS/2] begin() done — BAT sent, tasks started");
 }
@@ -412,24 +420,21 @@ void PS2Keyboard::_keyup(PS2Key key) {
   if (!_data_reporting) return;
   PS2Packet pkt;
   pkt.len = 0;
-  // Build break code: for multi-byte make codes, insert F0 before last byte,
-  // keep E0/E1 prefixes in front.
-  // Algorithm: copy all prefix bytes (E0/E1), then append F0, then last byte.
-  uint8_t makelen = MAKE[key][0];
-  const uint8_t *make = &MAKE[key][1];
 
   if (key == K_PAUSE) {
     // Pause has no break code
     return;
   }
 
-  // Copy E0/E1 prefix bytes
+  uint8_t makelen = MAKE[key][0];
+  const uint8_t *make = &MAKE[key][1];
+
+  // Set 2 break codes: copy E0/E1 prefixes, insert F0, then remaining bytes
   int i = 0;
   while (i < makelen - 1 && (make[i] == 0xE0 || make[i] == 0xE1)) {
     pkt.data[pkt.len++] = make[i++];
   }
   pkt.data[pkt.len++] = 0xF0;
-  // remaining bytes (last scancode byte)
   while (i < makelen) {
     pkt.data[pkt.len++] = make[i++];
   }
@@ -500,7 +505,9 @@ void PS2Keyboard::keyHid_send(uint8_t hid, bool down) {
     case 0xE2: key=K_LALT; break;   case 0xE3: key=K_LSUPER; break;
     case 0xE4: key=K_RCTRL; break;  case 0xE5: key=K_RSHIFT; break;
     case 0xE6: key=K_RALT; break;   case 0xE7: key=K_RSUPER; break;
-    default: return;
+    default:
+      // Unmapped HID key — skip silently (avoid Serial from Core 0 on every unknown key)
+      return;
   }
   if (down) _keydown(key); else _keyup(key);
 }
@@ -530,8 +537,15 @@ void ps2kb_task_send(void *arg) {
       xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
       ps2_delay_us(PS2KB_BYTE_INTERVAL_US);
       for (int i = 0; i < pkt.len; i++) {
-        kb->ps2_write_wait_idle(pkt.data[i]);
-        ps2_delay_us(PS2KB_BYTE_INTERVAL_US);
+        // Never silently drop a byte — retry until sent.
+        // If a byte is dropped from a multi-byte sequence (e.g. E0 + scancode),
+        // the 8042 enters a stalled state waiting for the missing byte, which
+        // causes permanently stuck or wrong keys until reset.
+        while (kb->ps2_write_wait_idle(pkt.data[i]) != 0) {
+          ps2_delay_us(PS2KB_BYTE_INTERVAL_US);
+        }
+        if (i < pkt.len - 1)
+          ps2_delay_us(PS2KB_BYTE_INTERVAL_US);
       }
       xSemaphoreGive(kb->get_mutex());
     }
@@ -571,7 +585,6 @@ void ps2kb_task_send(void *arg) {
 #define NVS_NS        "ble-ps2"
 #define NVS_KEY_MAC   "mac"
 #define NVS_KEY_TYPE  "type"
-#define CONNECT_TRIES 3
 
 // ── Global state ──────────────────────────────────────────────────────────────
 static PS2Keyboard    keyboard(PS2_CLK_PIN, PS2_DAT_PIN);
@@ -598,8 +611,7 @@ static volatile bool  statusRequested  = false; // LCtrl+LAlt+LShift+PrtSc
 static volatile bool  batteryRequested = false; // LCtrl+LAlt+PrtSc
 static NimBLERemoteCharacteristic* pLedChar  = nullptr; // HID output report (LED state)
 static NimBLERemoteCharacteristic* pBatChar  = nullptr; // battery level (used for keepalive)
-static unsigned long  keepaliveAt = 0;        // next keepalive read
-#define KEEPALIVE_MS  3000                    // read battery every 3s to prevent keyboard sleep
+#define KEEPALIVE_MS  3000  // keepalive interval — used by bleDaemonTask
 
 static unsigned long  scanEndAt = 0;
 static int            scanCount = 0;
@@ -611,6 +623,7 @@ static int            scanCount = 0;
 static unsigned long  typematicNext  = 0;
 static bool           typematicArmed = false;
 static uint8_t        typematicKey   = 0;
+
 
 // ── Key name helper for debug output ─────────────────────────────────────────
 const char* hidKeyName(uint8_t k) {
@@ -666,6 +679,7 @@ void processHIDReport(uint8_t* data, size_t len) {
   size_t   nkeys = hasReserved ? len - 2  : len - 1;
   if (nkeys > 6) nkeys = 6;
 
+  // Raw HID dump — helps diagnose wrong scan code mapping
   Serial.print("[HID] ");
   for (size_t i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
   Serial.println();
@@ -676,10 +690,8 @@ void processHIDReport(uint8_t* data, size_t len) {
     bool wasDown = (prevMod & mask) != 0;
     bool isDown  = (mod     & mask) != 0;
     if (isDown && !wasDown) {
-      Serial.printf("[+] %s\n", modName(bit));
       keyboard.keyHid_send(0xE0 + bit, true);
     } else if (!isDown && wasDown) {
-      Serial.printf("[-] %s\n", modName(bit));
       keyboard.keyHid_send(0xE0 + bit, false);
     }
   }
@@ -690,7 +702,6 @@ void processHIDReport(uint8_t* data, size_t len) {
     bool found = false;
     for (size_t j = 0; j < nkeys; j++) if (keys[j] == prevKeys[i]) { found = true; break; }
     if (!found) {
-      Serial.printf("[-] %s\n", hidKeyName(prevKeys[i]));
       keyboard.keyHid_send(prevKeys[i], false);
     }
   }
@@ -701,7 +712,6 @@ void processHIDReport(uint8_t* data, size_t len) {
     bool found = false;
     for (int j = 0; j < 6; j++) if (prevKeys[j] == keys[i]) { found = true; break; }
     if (!found) {
-      Serial.printf("[+] %s\n", hidKeyName(keys[i]));
       keyboard.keyHid_send(keys[i], true);
     }
   }
@@ -729,7 +739,7 @@ void processHIDReport(uint8_t* data, size_t len) {
     }
   }
   if (typematicKey) {
-    typematicArmed = false;           // reset — wait for initial delay
+    typematicArmed = false;
     typematicNext  = millis() + TYPEMATIC_DELAY_MS;
   } else {
     typematicArmed = false;
@@ -780,7 +790,7 @@ bool tryConnect(NimBLEAddress addr) {
   }
 
   pClient = NimBLEDevice::createClient();
-  pClient->setConnectionParams(6, 12, 0, 3200);
+  pClient->setConnectionParams(6, 6, 0, 3200);  // min interval for lowest latency
   pClient->setConnectTimeout(12);
 
   if (!pClient->connect(addr)) {
@@ -842,20 +852,25 @@ bool tryConnect(NimBLEAddress addr) {
         });
     }
   }
-  keepaliveAt = millis() + KEEPALIVE_MS;
-
   Serial.printf("[BLE] Bridge active — %d HID report(s)\n", subs);
   return true;
 }
 
-bool connectWithRetry(NimBLEAddress addr, int tries) {
-  for (int i = 1; i <= tries; i++) {
-    Serial.printf("[BLE] Attempt %d/%d: %s\n", i, tries, addr.toString().c_str());
+bool connectWithRetry(NimBLEAddress addr) {
+  int attempt = 0;
+  Serial.println("[BLE] Connecting — keep keyboard in pairing mode...");
+  while (true) {
+    attempt++;
+    Serial.printf("[BLE] Attempt %d\n", attempt);
     if (tryConnect(addr)) return true;
     Serial.println("[BLE] Failed.");
-    if (i < tries) delay(1500);
+    if (attempt >= 20) {
+      Serial.println("[BLE] Giving up. Try: connect <mac> again.");
+      return false;
+    }
+    if (Serial.available()) { Serial.readStringUntil('\n'); Serial.println("[BLE] Aborted."); return false; }
+    delay(500);
   }
-  return false;
 }
 
 // ── NVS ──────────────────────────────────────────────────────────────────────
@@ -887,7 +902,6 @@ void forgetKeyboard() {
   }
   pLedChar = nullptr;
   pBatChar = nullptr;
-  keepaliveAt = 0;
   NimBLEDevice::deleteAllBonds();
   prefs.begin(NVS_NS, false);
   prefs.remove(NVS_KEY_MAC); prefs.remove(NVS_KEY_TYPE);
@@ -923,7 +937,7 @@ void cmdConnect(String mac) {
   reconnectAt = 0; reconnectFailures = 0;
   NimBLEDevice::deleteAllBonds();
   NimBLEAddress addr(mac.c_str(), 1);
-  if (connectWithRetry(addr, CONNECT_TRIES))
+  if (connectWithRetry(addr))
     saveKeyboard(pClient->getPeerAddress());
   else
     Serial.println("[BLE] All attempts failed.");
@@ -1063,6 +1077,11 @@ void handleSerial() {
 void bleDaemonTask(void* arg) {
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(3000)); // check every 3 s
+    // Keepalive battery read — off loop() so it never causes key lag
+    if (pBatChar && pClient && pClient->isConnected()) {
+      std::string val = pBatChar->readValue();
+      if (!val.empty()) batteryLevel = (int)(uint8_t)val[0];
+    }
 
     if (strlen(savedMAC) == 0) continue;                     // no saved keyboard
     if (pClient && pClient->isConnected()) continue;          // all good
@@ -1087,6 +1106,7 @@ void bleDaemonTask(void* arg) {
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  Serial.setTimeout(20);  // cap readStringUntil blocking to 20ms max
   delay(200);
 
   // Disable WiFi — not needed, saves ~20 mA
@@ -1177,13 +1197,8 @@ void loop() {
     Serial.printf("[LED] BLE LED mask 0x%02X\n", led);
   }
 
-  // Keepalive — periodic battery read prevents keyboard from entering deep sleep
-  if (keepaliveAt && millis() >= keepaliveAt && pBatChar &&
-      pClient && pClient->isConnected()) {
-    keepaliveAt = millis() + KEEPALIVE_MS;
-    std::string val = pBatChar->readValue();
-    if (!val.empty()) batteryLevel = (int)(uint8_t)val[0];
-  }
+  // Keepalive moved to bleDaemonTask — readValue() blocks hundreds of ms
+  // which causes key lag in games that poll PS/2 tightly (e.g. Tyrian)
 
   // Battery type-out (LCtrl+LAlt+PrtSc)
   if (batteryRequested) {
@@ -1211,7 +1226,6 @@ void loop() {
   // Typematic repeat
   if (typematicKey && typematicNext && millis() >= typematicNext) {
     if (!typematicArmed) {
-      // First repeat after TYPEMATIC_DELAY_MS — switch to fast interval
       typematicArmed = true;
       typematicNext  = millis() + TYPEMATIC_RATE_MS;
     } else {
@@ -1220,5 +1234,5 @@ void loop() {
     keyboard.keyHid_send(typematicKey, true);
   }
 
-  delay(5);
+  delay(1);
 }
