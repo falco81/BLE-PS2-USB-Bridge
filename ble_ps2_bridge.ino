@@ -395,10 +395,7 @@ void PS2Keyboard::begin() {
   // Core 0 — same as reference project (BLE/Bluetooth also on core 0; that's fine,
   // scheduler handles it; reference project runs kb tasks on APP_CPU = core 0 by default)
   xTaskCreatePinnedToCore(ps2kb_task_host, "ps2host", 4096, this,  8, &_task_host, 0);
-  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2send", 4096, this, 15, &_task_send, 1);  // ps2send pinned to Core 1 at highest priority — scan codes must arrive without jitter
-  // ps2host on Core 0, lower priority — host commands (LED, reset) are rare
-
-  Serial.println("[PS/2] begin() done — BAT sent, tasks started");
+  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2send", 4096, this, 15, &_task_send, 1);
 }
 
 // ── send_packet() ─────────────────────────────────────────────────────────────
@@ -1107,21 +1104,20 @@ void bleDaemonTask(void* arg) {
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
+  // keyboard.begin() must be first — BIOS expects BAT 0xAA within ~500 ms of
+  // power-on. Serial.begin + delay(200) + WiFi deinit together take ~400 ms,
+  // which pushes BAT past the timeout on slow boots. Calling begin() first
+  // reduces the window to ~200 ms (the stabilisation delay inside begin()).
+  keyboard.begin();
+
   Serial.begin(115200);
-  Serial.setTimeout(20);  // cap readStringUntil blocking to 20ms max
   delay(200);
+
+  Serial.println("[PS/2] BAT sent, tasks started");  // begin() ran before Serial.begin()
 
   // Disable WiFi — not needed, saves ~20 mA
   esp_wifi_stop();
   esp_wifi_deinit();
-
-  Serial.println("\n================================");
-  Serial.println("  BLE -> PS/2 AT Bridge  v1.6");
-  Serial.printf ("  CLK=GPIO%d  DAT=GPIO%d\n", PS2_CLK_PIN, PS2_DAT_PIN);
-  Serial.println("================================");
-
-  // keyboard.begin() configures GPIO, sends BAT 0xAA, starts FreeRTOS tasks
-  keyboard.begin();
 
   // BLE
   NimBLEDevice::init(BRIDGE_NAME);

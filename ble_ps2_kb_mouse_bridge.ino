@@ -496,7 +496,6 @@ void PS2Keyboard::begin() {
   // PS/2 byte transmission never masks UART RX, so Serial console always works.
   // Priority 15 preempts BLE host stack (~pri 5) when a scan code needs sending.
   xTaskCreatePinnedToCore(ps2kb_task_send, "ps2kbsend", 4096, this, 15, &_task_send, 0);
-  Serial.println("[PS2KB] begin() done — BAT sent");
 }
 
 int PS2Keyboard::send_packet(PS2Packet *pkt) {
@@ -933,7 +932,6 @@ void PS2Mouse::begin() {
   // Core 0 — same reasoning as ps2kb_task_send: taskENTER_CRITICAL in ps2_write
   // must not run on Core 1 where UART RX interrupts live.
   xTaskCreatePinnedToCore(ps2mouse_task_send, "ps2msend", 4096, this, 15, &_task_send, 0);
-  Serial.println("[PS2MOUSE] begin() done — BAT+ID sent");
 }
 
 void ps2mouse_task_host(void *arg) {
@@ -1844,24 +1842,24 @@ void bleDaemonTask(void* arg) {
 // ════════════════════════════════════════════════════════════════════════════════
 
 void setup() {
+  // PS/2 devices first — BIOS expects BAT 0xAA within ~500 ms of power-on.
+  // Serial.begin + delay(200) + WiFi deinit together take ~400 ms which can
+  // push BAT past the BIOS timeout on slow boots. begin() contains its own
+  // 200 ms stabilisation delay, so BAT arrives ~200 ms after reset.
+  keyboard.begin();
+  delay(50);
+  mouse.begin();
+
   Serial.begin(115200);
   delay(200);
   // Serial.setTimeout not needed — handleSerial() uses a non-blocking
   // character accumulator that never calls readStringUntil().
 
+  Serial.println("[PS2KB] BAT sent");    // begin() ran before Serial.begin()
+  Serial.println("[PS2MOUSE] BAT+ID sent");
+
   esp_wifi_stop();
   esp_wifi_deinit();
-
-  Serial.println("\n========================================");
-  Serial.println("  BLE -> PS/2 Keyboard + Mouse  v2.0");
-  Serial.printf ("  KB:    CLK=GPIO%d  DAT=GPIO%d\n", PS2_KB_CLK_PIN, PS2_KB_DAT_PIN);
-  Serial.printf ("  MOUSE: CLK=GPIO%d  DAT=GPIO%d\n", PS2_MOUSE_CLK_PIN, PS2_MOUSE_DAT_PIN);
-  Serial.println("========================================");
-
-  // Start both PS/2 devices — each sends BAT + ID, starts FreeRTOS tasks
-  keyboard.begin();
-  delay(50);
-  mouse.begin();
 
   // BLE — must init after PS/2 tasks (NimBLE uses Core 0, same as ps2 tasks; scheduler handles it)
   NimBLEDevice::init(BRIDGE_NAME);
