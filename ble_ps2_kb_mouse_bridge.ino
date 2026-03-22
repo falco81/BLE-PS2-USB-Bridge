@@ -79,7 +79,7 @@ static volatile uint8_t pendingLedMask = 0xFF; // 0xFF = no pending update
 #define PS2_CLK_HALF_US       40    // half clock period µs  (spec 30–50)
 #define PS2_CLK_QUARTER_US    20
 #define PS2_BYTE_INTERVAL_US 500    // gap between bytes
-#define PS2_HOST_POLL_MS       9    // host-command poll interval
+#define PS2_HOST_POLL_MS       2    // how often to check for host commands
 #define PS2_PACKET_QUEUE_LEN  32
 
 static uint64_t ps2_micros() { return esp_timer_get_time(); }
@@ -91,7 +91,7 @@ static void ps2_delay_us(uint32_t us) {
 // Generic PS/2 packet — reused by both keyboard and mouse
 struct PS2Packet {
   uint8_t len;
-  uint8_t data[8];
+  uint8_t data[16];  // 16 bytes: PAUSE make code is 8 bytes (longest sequence)
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -134,7 +134,7 @@ public:
   enum class BusState { IDLE, INHIBITED, HOST_REQUEST_TO_SEND };
   BusState get_bus_state();
   int  ps2_write(uint8_t data);
-  int  ps2_write_wait_idle(uint8_t data, uint64_t timeout_us = 1500);
+  int  ps2_write_wait_idle(uint8_t data, uint64_t timeout_us = 100000);
   int  ps2_read(uint8_t *data, uint64_t timeout_ms = 0);
   void reply_to_host(uint8_t cmd);
   int  send_packet(PS2Packet *pkt);
@@ -178,7 +178,7 @@ public:
   enum class BusState { IDLE, INHIBITED, HOST_REQUEST_TO_SEND };
   BusState get_bus_state();
   int  ps2_write(uint8_t data);
-  int  ps2_write_wait_idle(uint8_t data, uint64_t timeout_us = 1500);
+  int  ps2_write_wait_idle(uint8_t data, uint64_t timeout_us = 100000);
   int  ps2_read(uint8_t *value, uint64_t timeout_ms = 0);
   void reply_to_host(uint8_t cmd);
   int  send_packet(PS2Packet *pkt);
@@ -427,8 +427,8 @@ void PS2Keyboard::begin() {
   vTaskDelay(pdMS_TO_TICKS(200));
   ps2_write(0xAA);
   xSemaphoreGive(_mutex);
-  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2kbhost", 4096, this, 10, &_task_host, 0);
-  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2kbsend", 4096, this,  9, &_task_send, 0);
+  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2kbhost", 4096, this,  8, &_task_host, 0);  // Core 0, pri 8 — host cmds are rare
+  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2kbsend", 4096, this, 15, &_task_send, 1);  // Core 1, pri 15 — scan codes must not jitter
   Serial.println("[PS2KB] begin() done — BAT sent");
 }
 
@@ -547,8 +547,16 @@ void ps2kb_task_send(void *arg) {
       xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
       ps2_delay_us(PS2_BYTE_INTERVAL_US);
       for (int i = 0; i < pkt.len; i++) {
-        kb->ps2_write_wait_idle(pkt.data[i]);
-        ps2_delay_us(PS2_BYTE_INTERVAL_US);
+        // Never silently drop a byte — retry until sent.
+        // If a byte is dropped mid-sequence (e.g. E0 + scancode for arrow key),
+        // the 8042 stalls waiting for the missing byte → stuck/wrong keys until reset.
+        // 8042 may inhibit clock while CPU reads port 0x60 (IRQ1 handler latency).
+        // 100 ms timeout in ps2_write_wait_idle covers any realistic handler.
+        while (kb->ps2_write_wait_idle(pkt.data[i]) != 0) {
+          ps2_delay_us(PS2_BYTE_INTERVAL_US);
+        }
+        if (i < pkt.len - 1)
+          ps2_delay_us(PS2_BYTE_INTERVAL_US);
       }
       xSemaphoreGive(kb->get_mutex());
     }
@@ -854,8 +862,8 @@ void PS2Mouse::begin() {
   ps2_write(0x00); // Device ID: standard mouse (IntelliMouse activates later via host command)
   xSemaphoreGive(_mutex);
 
-  xTaskCreatePinnedToCore(ps2mouse_task_host, "ps2mhost", 4096, this, 10, &_task_host, 0);
-  xTaskCreatePinnedToCore(ps2mouse_task_send, "ps2msend", 4096, this,  9, &_task_send, 0);
+  xTaskCreatePinnedToCore(ps2mouse_task_host, "ps2mhost", 4096, this,  8, &_task_host, 0);  // Core 0, pri 8 — host cmds are rare
+  xTaskCreatePinnedToCore(ps2mouse_task_send, "ps2msend", 4096, this, 15, &_task_send, 1);  // Core 1, pri 15 — movement packets must not jitter
   Serial.println("[PS2MOUSE] begin() done — BAT+ID sent");
 }
 
@@ -880,8 +888,12 @@ void ps2mouse_task_send(void *arg) {
       xSemaphoreTake(m->get_mutex(), portMAX_DELAY);
       ps2_delay_us(PS2_BYTE_INTERVAL_US);
       for (int i = 0; i < pkt.len; i++) {
-        m->ps2_write_wait_idle(pkt.data[i]);
-        ps2_delay_us(PS2_BYTE_INTERVAL_US);
+        // Retry until sent — host may inhibit clock while reading previous byte.
+        while (m->ps2_write_wait_idle(pkt.data[i]) != 0) {
+          ps2_delay_us(PS2_BYTE_INTERVAL_US);
+        }
+        if (i < pkt.len - 1)
+          ps2_delay_us(PS2_BYTE_INTERVAL_US);
       }
       xSemaphoreGive(m->get_mutex());
     }
@@ -901,7 +913,7 @@ void ps2mouse_task_send(void *arg) {
 // ── Misc configuration ────────────────────────────────────────────────────────
 #define BRIDGE_NAME   "BLE-PS2-Bridge"
 #define NVS_NS        "ble-ps2"
-#define CONNECT_TRIES 3
+// Both keyboard and mouse use up-to-20 attempt retry loops in handleSerial()
 
 // ── Typematic ─────────────────────────────────────────────────────────────────
 #define TYPEMATIC_DELAY_MS 500
@@ -1129,29 +1141,6 @@ void processMouseMovement() {
 //  KEYBOARD — BLE HID report processing  (identical to v1.6)
 // ════════════════════════════════════════════════════════════════════════════════
 
-const char* hidKeyName(uint8_t k) {
-  if (k >= 0x04 && k <= 0x1D) { static char b[3]; b[0]='A'+(k-0x04); b[1]=0; return b; }
-  if (k >= 0x1E && k <= 0x27) { static char b[4]; sprintf(b,"D%d",(k==0x27)?0:(k-(uint8_t)0x1D)); return b; }
-  switch (k) {
-    case 0x28:return"Enter"; case 0x29:return"Esc";  case 0x2A:return"BkSp";
-    case 0x2B:return"Tab";   case 0x2C:return"Space";case 0x39:return"CapsLk";
-    case 0x3A:return"F1";    case 0x3B:return"F2";   case 0x3C:return"F3";
-    case 0x3D:return"F4";    case 0x3E:return"F5";   case 0x3F:return"F6";
-    case 0x40:return"F7";    case 0x41:return"F8";   case 0x42:return"F9";
-    case 0x43:return"F10";   case 0x44:return"F11";  case 0x45:return"F12";
-    case 0x4C:return"Del";   case 0x52:return"Up";   case 0x51:return"Down";
-    case 0x50:return"Left";  case 0x4F:return"Right";
-    default:{ static char b[5]; sprintf(b,"%02X",k); return b; }
-  }
-}
-const char* modName(int bit) {
-  switch(bit) {
-    case 0:return"LCtrl"; case 1:return"LShift"; case 2:return"LAlt"; case 3:return"LGUI";
-    case 4:return"RCtrl"; case 5:return"RShift"; case 6:return"RAlt"; case 7:return"RGUI";
-    default:return"?";
-  }
-}
-
 void processHIDReport(uint8_t* data, size_t len) {
   if (len < 2) return;
   uint8_t mod = data[0];
@@ -1160,6 +1149,7 @@ void processHIDReport(uint8_t* data, size_t len) {
   size_t   nkeys = hasReserved ? len - 2  : len - 1;
   if (nkeys > 6) nkeys = 6;
 
+  // Raw HID dump — one line per report, enough for diagnostics without flooding Core 0
   Serial.print("[KB] ");
   for (size_t i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
   Serial.println();
@@ -1169,22 +1159,22 @@ void processHIDReport(uint8_t* data, size_t len) {
     uint8_t mask = 1 << bit;
     bool wasDown = (prevMod & mask) != 0;
     bool isDown  = (mod     & mask) != 0;
-    if ( isDown && !wasDown) { Serial.printf("[+] %s\n", modName(bit)); keyboard.keyHid_send((uint8_t)(0xE0 + bit), true);  }
-    if (!isDown &&  wasDown) { Serial.printf("[-] %s\n", modName(bit)); keyboard.keyHid_send((uint8_t)(0xE0 + bit), false); }
+    if ( isDown && !wasDown) keyboard.keyHid_send((uint8_t)(0xE0 + bit), true);
+    if (!isDown &&  wasDown) keyboard.keyHid_send((uint8_t)(0xE0 + bit), false);
   }
   // Released keys
   for (int i = 0; i < 6; i++) {
     if (prevKeys[i] == 0 || prevKeys[i] == 0x01) continue;
     bool found = false;
     for (size_t j = 0; j < nkeys; j++) if (keys[j] == prevKeys[i]) { found=true; break; }
-    if (!found) { Serial.printf("[-] %s\n", hidKeyName(prevKeys[i])); keyboard.keyHid_send(prevKeys[i], false); }
+    if (!found) keyboard.keyHid_send(prevKeys[i], false);
   }
   // Pressed keys
   for (size_t i = 0; i < nkeys; i++) {
     if (keys[i] == 0 || keys[i] == 0x01) continue;
     bool found = false;
     for (int j = 0; j < 6; j++) if (prevKeys[j] == keys[i]) { found=true; break; }
-    if (!found) { Serial.printf("[+] %s\n", hidKeyName(keys[i])); keyboard.keyHid_send(keys[i], true); }
+    if (!found) keyboard.keyHid_send(keys[i], true);
   }
 
   prevMod = mod;
@@ -1274,7 +1264,7 @@ bool tryConnectKb(NimBLEAddress addr) {
   }
   Serial.printf("[KB] Connecting to %s ...\n", addr.toString().c_str());
   pClientKb = NimBLEDevice::createClient();
-  pClientKb->setConnectionParams(6, 12, 0, 3200);
+  pClientKb->setConnectionParams(6, 6, 0, 3200);  // fixed 7.5 ms interval — lowest BLE latency
   pClientKb->setConnectTimeout(12);
   if (!pClientKb->connect(addr)) {
     NimBLEDevice::deleteClient(pClientKb); pClientKb = nullptr; return false;
@@ -1305,8 +1295,8 @@ bool tryConnectKb(NimBLEAddress addr) {
       if (bc->canNotify()) bc->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) { if(l>0) kbBattery=(int)d[0]; });
     }
   }
-  kbKeepaliveAt = millis() + KEEPALIVE_MS;
   memset(prevKeys, 0, 6); prevMod = 0;
+  kbKeepaliveAt = millis() + KEEPALIVE_MS;
   Serial.printf("[KB] Connected — %d char(s), battery %d%%\n", subs, kbBattery);
   return true;
 }
@@ -1322,7 +1312,7 @@ bool tryConnectMouse(NimBLEAddress addr) {
   }
   Serial.printf("[MOUSE] Connecting to %s ...\n", addr.toString().c_str());
   pClientMouse = NimBLEDevice::createClient();
-  pClientMouse->setConnectionParams(6, 12, 0, 3200);
+  pClientMouse->setConnectionParams(6, 6, 0, 3200);  // fixed 7.5 ms interval
   pClientMouse->setConnectTimeout(12);
   if (!pClientMouse->connect(addr)) {
     NimBLEDevice::deleteClient(pClientMouse); pClientMouse = nullptr; return false;
@@ -1576,14 +1566,19 @@ void handleSerial() {
     if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt=0; isManualScan=false; }
     kbReconnectAt=0; kbReconnectFails=0;
     { NimBLEAddress a(mac.c_str(), 1); NimBLEDevice::deleteBond(a); } delay(100);
-    NimBLEAddress addr(mac.c_str(), 1); bool ok=false;
-    for (int i=0; i<CONNECT_TRIES && !ok; i++) {
-      Serial.printf("[KB] Attempt %d/%d\n", i+1, CONNECT_TRIES);
+    NimBLEAddress addr(mac.c_str(), 1); bool ok=false; int attempt=0;
+    Serial.println("[KB] Connecting — keep keyboard in pairing mode...");
+    while (!ok) {
+      attempt++;
+      Serial.printf("[KB] Attempt %d\n", attempt);
       ok = tryConnectKb(addr);
-      if (!ok && i<CONNECT_TRIES-1) delay(1500);
+      if (!ok) {
+        if (attempt >= 20) { Serial.println("[KB] Giving up. Try: connect kb <mac> again."); break; }
+        if (Serial.available()) { Serial.readStringUntil('\n'); Serial.println("[KB] Aborted."); break; }
+        delay(500);
+      }
     }
     if (ok) saveKb(pClientKb->getPeerAddress());
-    else    Serial.println("[KB] All connection attempts failed.");
 
   } else if (line.startsWith("connect mouse ")) {
     String mac = line.substring(14); mac.trim();
@@ -1891,5 +1886,5 @@ void loop() {
   // ── Mouse movement → PS/2 ────────────────────────────────────────────────────
   processMouseMovement();
 
-  delay(5);
+  delay(1);
 }
