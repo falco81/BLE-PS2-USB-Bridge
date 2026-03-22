@@ -26,7 +26,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 - **Battery shortcut** — press **LCtrl+LAlt+PrintScreen** to type the keyboard battery percentage (e.g. `78%`)
 - **Status shortcut** — press **LCtrl+LAlt+LShift+PrintScreen** to type the full bridge status into any text field
 - **NVS storage** — paired keyboard remembered across reboots
-- **Keepalive** — periodic battery level read every 3 s keeps the BLE keyboard awake; runs in `bleDaemonTask` so it never blocks PS/2 timing
+- **Keepalive** — periodic battery read every 30 s keeps the BLE keyboard awake; runs in `bleDaemonTask` on Core 0 so it never blocks PS/2 timing; result discarded — battery value is maintained exclusively by the BLE notification callback
 - **WiFi disabled** — WiFi stack is deinitialised at startup, saving ~20 mA
 - **HID report format auto-detection** — handles both standard 8-byte reports (with reserved byte) and compact 7-byte reports (reserved byte omitted) transparently
 - **Persistent connect** — `connect` retries up to 20 times with 500 ms gaps; press any key in Serial Monitor to abort
@@ -265,20 +265,26 @@ The heuristic is `len == 8 && data[1] == 0x00` → standard format; otherwise co
 ```
 Core 0                          Core 1
 ──────────────────────          ──────────────────────────────
-BLE stack (NimBLE)              ps2send task  (priority 15)
-  └─ notifyCallback()             xQueueReceive() → ps2_write()
-       └─ keyboard.keyHid_send()  retry loop — never drops a byte
-            └─ xQueueSend()
-                                ps2host task  (priority 8)
-bleDaemonTask (priority 1)        checks CLK/DATA every 2 ms
-  check every 1 s                 → reply_to_host()
-  keepalive readValue()
-  scan-before-connect if lost   loop() (Arduino default)
-                                  handleSerial()
-                                  typematic, LED forward
+BLE stack (NimBLE)              loop() (Arduino default)
+  └─ notifyCallback()             handleSerial() — non-blocking
+       └─ keyboard.keyHid_send()  typematic, LED forward
+            └─ xQueueSend()       UART RX interrupts live here
+
+ps2send task  (priority 15)
+  xQueueReceive() → ps2_write()
+  retry loop — never drops a byte
+
+ps2host task  (priority 8)
+  checks CLK/DATA every 2 ms
+  → reply_to_host()
+
+bleDaemonTask (priority 1)
+  check every 1 s
+  keepalive readValue() — result discarded
+  scan-before-connect if lost
 ```
 
-The send task runs on **Core 1 at priority 15** — the highest priority task on that core. Neither `loop()` nor any Arduino library code can preempt it. The host task runs on Core 0 at lower priority alongside the BLE stack; host commands (LED, Reset) are rare and latency-tolerant.
+The send task runs on **Core 0 at priority 15**. This is deliberate: `ps2_write()` uses `taskENTER_CRITICAL` which masks interrupts on the running core. Running on Core 0 means UART RX interrupts on Core 1 are never masked, so the serial console always works while PS/2 bytes are being transmitted. The host task also runs on Core 0; host commands (LED, Reset) are rare and latency-tolerant.
 
 ### Timing constants
 
@@ -287,10 +293,10 @@ The send task runs on **Core 1 at priority 15** — the highest priority task on
 | CLK half period | 40 µs | PS/2 spec (30–50 µs) |
 | Byte interval | 500 µs | Gap between bytes in a packet |
 | Host poll interval | 2 ms | Checks CLK/DATA for host commands |
-| `ps2_write_wait_idle` timeout | 100 ms | Waits for 8042 clock release; covers slow IRQ1 handlers in DOS games |
+| `ps2_write_wait_idle` timeout | 100 ms | Waits for 8042 clock release; covers slow IRQ1 handlers in DOS games; uses `vTaskDelay(1)` to feed watchdog |
 | BLE connection interval | 7.5 ms | Fixed (min=max=6 units) — lowest available BLE latency |
 | Supervision timeout | 32 s | BLE connection parameter |
-| Keepalive interval | 3 s | Battery read in bleDaemonTask to prevent keyboard sleep |
+| Keepalive interval | 30 s | Battery read in bleDaemonTask — result discarded, value comes from notification |
 
 ---
 
@@ -307,8 +313,10 @@ The send task runs on **Core 1 at priority 15** — the highest priority task on
 | Reconnect takes a while | Keyboard not advertising yet | Normal — firmware scans and waits, connects as soon as keyboard is visible |
 | Lock key LEDs wrong | Bridge just connected | Press the lock key once to resync state |
 | 5–10 s input delay after idle | Keyboard entered BLE sleep | Fixed by keepalive — if it persists, reduce `KEEPALIVE_MS` |
-| Stuck keys / wrong key in games | IRQ1 handler inhibits clock longer than old 1.5 ms timeout | Fixed — timeout is now 100 ms with retry; no byte is ever dropped |
-| Input lag in tight-polling games (Tyrian, etc.) | `readValue()` blocking `loop()` | Fixed — keepalive moved to `bleDaemonTask` on Core 0 |
+| Stuck keys / wrong key in games | IRQ1 handler inhibits clock longer than old 1.5 ms timeout | Fixed — timeout is now 100 ms with `vTaskDelay(1)` retry; no byte is ever dropped |
+| Input lag in tight-polling games (Tyrian, etc.) | `readValue()` blocking `loop()` | Fixed — keepalive moved to `bleDaemonTask` on Core 0; result discarded |
+| Serial console stops responding after keyboard connects | PS/2 `taskENTER_CRITICAL` masking UART RX on Core 1 | Fixed — PS/2 send tasks run on Core 0; UART RX on Core 1 is never masked |
+| Battery shows wrong value | BLE device reports stale value via `readValue()` | Fixed — battery value comes exclusively from BLE notification callback |
 
 ---
 
@@ -400,16 +408,19 @@ Both can be connected simultaneously. Use the UART port for Arduino IDE uploads 
 ```
 notifyCallback()          ← BLE HID notify from keyboard
   └─ processHIDReport()
-       ├─ usbApplyModifiers(mod)   → hidKb.pressRaw() / releaseRaw() per bit
+       ├─ usbApplyModifiers(mod)   → hidKb.pressRaw() / releaseRaw() per bit (always, not just on change)
+       ├─ LED sync (lock keys)     → checked before prevKeys overwrite to detect edge correctly
        ├─ usbKeyUp(keycode)        → hidKb.releaseRaw(keycode)
        └─ usbKeyDown(keycode)      → hidKb.pressRaw(keycode)
 
 loop()
   └─ Typematic: hidKb.pressRaw(typematicKey) every 50 ms after 500 ms hold
+     typematic variables are volatile — safe across Core 0 write / Core 1 read
   └─ statusRequested: typeStatusViaUSB() on Ctrl+Alt+PrintScreen
 
 bleDaemonTask (FreeRTOS, core 0)
   └─ check every 3 s → hidKb.releaseAll() + scan-before-connect
+  └─ keepalive readValue() — result discarded, battery from notification
 ```
 
 Since the BLE HID Usage Table (Keyboard/Keypad, Usage Page 0x07) is identical to USB HID, keycodes are forwarded directly without a translation table.
@@ -689,15 +700,20 @@ Core 0                           Core 1 (Arduino loop)
 BLE stack (NimBLE)               loop()
   ├─ kbNotifyCallback()            ├─ handleSerial() — UART + CDC
   │    └─ processKbReport()        ├─ keyboard: typematic, hotkeys
-  │         └─ hidKb.pressRaw()    ├─ mouse: processMouseMovement()
-  │                                │    └─ hidMouse.move()
-  └─ mouseNotifyCallback()         │    └─ hidMouse.press/release()
-       └─ portENTER_CRITICAL       ├─ kb/mouse keepalive
-            g_accX/Y/W += delta    ├─ kb/mouse reconnect logic
-            g_buttons = btns       └─ scan end handling
+  │         ├─ usbApplyModifiers() │    typematic vars are volatile
+  │         ├─ LED sync            ├─ mouse: processMouseMovement()
+  │         │   (before prevKeys   │    └─ hidMouse.move()
+  │         │    overwrite)        │    └─ hidMouse.press/release()
+  │         └─ hidKb.pressRaw()    ├─ kb/mouse reconnect logic
+  │                                └─ scan end handling
+  └─ mouseNotifyCallback()
+       └─ portENTER_CRITICAL
+            g_accX/Y/W += delta
+            g_buttons = btns
 
 bleDaemonTask (FreeRTOS, core 0, priority 1)
   check every 1 s
+  keepalive readValue() — result discarded, battery from notification
   → independent reconnect scan for kb and mouse
   → skipped during manual scan (isManualScan flag)
 
@@ -839,8 +855,9 @@ Both ports use the same level-shifter wiring pattern. Each PS/2 port requires it
 - **Independent auto-reconnect** — each BLE device reconnects separately
 - **NVS storage** — both MACs and all mouse settings saved across reboots
 - **Keepalive** — battery read runs in `bleDaemonTask`; never blocks PS/2 timing
-- **No byte drops** — send tasks retry every byte; multi-byte sequences never left incomplete
-- **Game-safe timing** — 100 ms clock-inhibit tolerance; `ps2send` tasks on Core 1 at priority 15
+- **No byte drops** — send tasks retry every byte; multi-byte sequences never left incomplete; `vTaskDelay(1)` in wait loop feeds the task watchdog
+- **Game-safe timing** — 100 ms clock-inhibit tolerance; `ps2send` tasks on Core 0 at priority 15; UART RX on Core 1 is never masked during PS/2 transmission
+- **Serial console always works** — non-blocking character accumulator replaces `readStringUntil`; all Core 0 log output routed through a lock-free queue to Core 1
 - **LED sync** — NumLock / CapsLock / ScrollLock forwarded from PC to BLE keyboard
 - **Battery shortcut** — **LCtrl+LAlt+PrtSc** types both levels: `K: 80% M: 95%`
 - **Status shortcut** — **LCtrl+LAlt+LShift+PrtSc** types full status block via PS/2 keyboard
@@ -1029,27 +1046,28 @@ Proto:    Explorer (0x04, scroll+Back+Fwd)
 ```
 Core 0                              Core 1
 ────────────────────────            ──────────────────────────────────
-BLE stack (NimBLE)                  ps2kb_send  (priority 15)
-  ├─ kbNotifyCallback()               retry loop → ps2_write() KB
-  │    └─ processHIDReport()
-  │         └─ keyboard.keyHid_send() ps2mouse_send  (priority 15)
-  │              └─ xQueueSend()        retry loop → ps2_write() Mouse
+BLE stack (NimBLE)                  loop() (Arduino default)
+  ├─ kbNotifyCallback()               handleSerial() — non-blocking
+  │    └─ processHIDReport()          typematic (volatile vars)
+  │         └─ keyboard.keyHid_send() processMouseMovement()
+  │              └─ xQueueSend()      UART RX interrupts live here
   │
-  └─ mouseNotifyCallback()           ps2kb_host  (priority 8, Core 0)
-       └─ portENTER_CRITICAL           checks CLK/DATA every 2 ms
-            g_accX/Y/W += delta        → reply_to_host() + flushQueue()
+  └─ mouseNotifyCallback()          ps2kb_send  (priority 15, Core 0)
+       └─ portENTER_CRITICAL          retry loop → ps2_write() KB
+            g_accX/Y/W += delta       vTaskDelay(1) in wait loop
             g_buttons = btns
-                                     ps2mouse_host  (priority 8, Core 0)
-bleDaemonTask (priority 1, Core 0)     checks CLK/DATA every 2 ms
-  check every 1 s                      → reply_to_host() + flushQueue()
-  keepalive readValue() — blocking
-  never reaches Core 1              loop() (Core 1, Arduino default)
-  scan-before-connect if lost         handleSerial()
-                                      typematic, LED forward
-                                      processMouseMovement()
+                                    ps2mouse_send  (priority 15, Core 0)
+ps2kb_host   (priority 8, Core 0)    retry loop → ps2_write() Mouse
+  checks CLK/DATA every 2 ms
+  → reply_to_host() + flushQueue() ps2mouse_host  (priority 8, Core 0)
+                                    checks CLK/DATA every 2 ms
+bleDaemonTask (priority 1, Core 0)  → reply_to_host() + flushQueue()
+  check every 1 s
+  keepalive readValue() — discarded
+  scan-before-connect if lost
 ```
 
-Both send tasks run on **Core 1 at priority 15** — the highest priority on that core. Neither `loop()` nor any interrupt can preempt PS/2 byte transmission. Both host tasks run on Core 0 alongside the BLE stack at priority 8 — host commands (Reset, LED, Get ID) are rare and can tolerate minor latency.
+Both send tasks run on **Core 0 at priority 15**. `ps2_write()` uses `taskENTER_CRITICAL` which masks interrupts on its core — by running on Core 0 the UART RX interrupts on Core 1 are never affected. All Core 0 Serial output is routed through a lock-free ring buffer; `loop()` on Core 1 drains it without blocking.
 
 ### Timing
 
@@ -1058,10 +1076,10 @@ Both send tasks run on **Core 1 at priority 15** — the highest priority on tha
 | CLK half period | 40 µs |
 | Byte interval | 500 µs |
 | Host poll interval | 2 ms |
-| `ps2_write_wait_idle` timeout | 100 ms — covers slow DOS IRQ1 handlers |
+| `ps2_write_wait_idle` timeout | 100 ms — covers slow DOS IRQ1 handlers; uses `vTaskDelay(1)` to feed task watchdog |
 | BLE connection interval | 7.5 ms fixed (min=max=6 units) |
 | Supervision timeout | 32 s |
-| Keepalive interval | 3 s |
+| Keepalive interval | 30 s — read to keep device awake; result discarded |
 
 ### NVS Keys
 
@@ -1087,8 +1105,10 @@ Both send tasks run on **Core 1 at priority 15** — the highest priority on tha
 | Mouse cursor erratic | Scale too low | Try `scale 4` or `scale 8` |
 | Scroll direction reversed | — | Use `flipw` |
 | Mouse detected as wrong protocol | Driver doesn't support Explorer | Use `proto 3` or `proto 0` |
-| Stuck keys in DOS games | — | Fixed — retry loop and 100 ms timeout prevent byte drops |
-| Input lag in tight-polling games | — | Fixed — keepalive and send tasks do not run on Core 1 |
+| Stuck keys in DOS games | — | Fixed — retry loop and 100 ms timeout prevent byte drops; `vTaskDelay(1)` keeps watchdog fed |
+| Input lag in tight-polling games | — | Fixed — keepalive result discarded; send tasks on Core 0 do not affect Core 1 loop timing |
+| Serial console stops after keyboard connects | PS/2 `taskENTER_CRITICAL` masked UART RX | Fixed — send tasks on Core 0; UART RX on Core 1 never masked |
+| Battery shows wrong value | BLE device returns stale cached value via `readValue()` | Fixed — battery value comes from BLE notification callback only |
 | Back / Forward not working | Driver / OS mapping | Buttons are forwarded as PS/2 Explorer byte3 bits 4–5; requires Explorer-aware driver |
 | Only one device reconnects | Both devices reconnect at staggered times by design | Normal — keyboard at ~500 ms, mouse at ~800 ms after boot |
 
