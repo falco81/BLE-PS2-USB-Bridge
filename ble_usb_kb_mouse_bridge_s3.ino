@@ -165,10 +165,11 @@ static uint8_t prevKeys[6] = {0};
 static uint8_t prevMod     = 0;
 
 // Typematic
-static unsigned long typematicNext  = 0;
-static bool          typematicArmed = false;
-static uint8_t       typematicKey   = 0;
-static uint8_t       typematicMod   = 0;
+// volatile — written by processKbReport on Core 0, read by loop() on Core 1
+static volatile unsigned long typematicNext  = 0;
+static volatile bool          typematicArmed = false;
+static volatile uint8_t       typematicKey   = 0;
+static volatile uint8_t       typematicMod   = 0;
 
 // Keyboard hotkey flags
 static volatile bool statusRequested  = false;
@@ -290,50 +291,43 @@ void processKbReport(uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; i++) conPrintf("%02X ", data[i]);
   conPrint("\n");
 
-  if (mod != prevMod) {
-    usbApplyModifiers(mod);
-    for (int bit = 0; bit < 8; bit++) {
-      uint8_t mask = 1 << bit;
-      bool was = (prevMod & mask) != 0;
-      bool is  = (mod     & mask) != 0;
-      if (is  && !was) Serial.printf("[KB+] %s\n", modName(bit));
-      if (!is &&  was) Serial.printf("[KB-] %s\n", modName(bit));
-    }
-  }
+  // Apply modifiers — always (not just on change) to handle reconnect/state drift
+  usbApplyModifiers(mod);
 
   for (int i = 0; i < 6; i++) {
     if (!prevKeys[i] || prevKeys[i] == 0x01) continue;
     bool found = false;
     for (size_t j = 0; j < nkeys; j++) if (keys[j] == prevKeys[i]) { found = true; break; }
-    if (!found) { Serial.printf("[KB-] %s\n", hidKeyName(prevKeys[i])); usbKeyUp(prevKeys[i]); }
+    if (!found) { usbKeyUp(prevKeys[i]); }
   }
   for (size_t i = 0; i < nkeys; i++) {
     if (!keys[i] || keys[i] == 0x01) continue;
     bool found = false;
     for (int j = 0; j < 6; j++) if (prevKeys[j] == keys[i]) { found = true; break; }
-    if (!found) { Serial.printf("[KB+] %s\n", hidKeyName(keys[i])); usbKeyDown(keys[i]); }
+    if (!found) { usbKeyDown(keys[i]); }
   }
 
-  prevMod = mod;
-  memset(prevKeys, 0, 6);
-  memcpy(prevKeys, keys, nkeys);
-
-  // LED sync (lock key toggle tracking)
+  // LED sync — must run BEFORE prevKeys is overwritten so wasDown reflects old state
   {
     static uint8_t bleLedMask = 0;
-    uint8_t lockKeys[] = { 0x53, 0x39, 0x47 };
+    uint8_t lockKeys[] = { 0x53, 0x39, 0x47 };  // NumLock, CapsLock, ScrollLock
     uint8_t ledBits[]  = { 0x01, 0x02, 0x04 };
     for (int k = 0; k < 3; k++) {
-      bool isDown = false, wasDown = false;
+      bool isDown  = false;
+      bool wasDown = false;
       for (size_t i = 0; i < nkeys; i++) if (keys[i]     == lockKeys[k]) isDown  = true;
       for (int    i = 0; i < 6;     i++) if (prevKeys[i] == lockKeys[k]) wasDown = true;
       if (isDown && !wasDown && pKbLedChar) {
         bleLedMask ^= ledBits[k];
         pKbLedChar->writeValue(&bleLedMask, 1, false);
-        Serial.printf("[LED] 0x%02X\n", bleLedMask);
+        conPrintf("[LED] 0x%02X\n", bleLedMask);
       }
     }
   }
+
+  prevMod = mod;
+  memset(prevKeys, 0, 6);
+  memcpy(prevKeys, keys, nkeys);
 
   // Hotkeys
   bool lctrl  = (mod & 0x01) != 0;
@@ -1227,17 +1221,16 @@ void loop() {
   }
 
   // ── Keyboard keepalive ───────────────────────────────────────────────────
+  // Read to prevent sleep — result discarded, battery value comes from notification.
   if (kbKeepaliveAt && millis() >= kbKeepaliveAt && pKbBatChar && pClientKb && pClientKb->isConnected()) {
     kbKeepaliveAt = millis() + KEEPALIVE_MS;
-    std::string v = pKbBatChar->readValue();
-    if (!v.empty()) kbBattery = (int)(uint8_t)v[0];
+    pKbBatChar->readValue();
   }
 
   // ── Mouse keepalive ──────────────────────────────────────────────────────
   if (mouseKeepaliveAt && millis() >= mouseKeepaliveAt && pMouseBatChar && pClientMouse && pClientMouse->isConnected()) {
     mouseKeepaliveAt = millis() + KEEPALIVE_MS;
-    std::string v = pMouseBatChar->readValue();
-    if (!v.empty()) mouseBattery = (int)(uint8_t)v[0];
+    pMouseBatChar->readValue();
   }
 
   // ── Keyboard hotkeys ─────────────────────────────────────────────────────
@@ -1258,9 +1251,19 @@ void loop() {
   if (typematicKey && typematicNext && millis() >= typematicNext) {
     if (!typematicArmed) { typematicArmed = true; typematicNext = millis() + TYPEMATIC_RATE_MS; }
     else                 { typematicNext  = millis() + TYPEMATIC_RATE_MS; }
-    for (int bit = 0; bit < 8; bit++)
-      if (typematicMod & (1 << bit)) hidKb.pressRaw(0xE0 + bit);
-    hidKb.pressRaw(typematicKey);
+    uint8_t k = typematicKey; // snapshot — Core 0 may clear typematicKey any time
+    uint8_t m = typematicMod;
+    if (k) {
+      for (int bit = 0; bit < 8; bit++)
+        if (m & (1 << bit)) hidKb.pressRaw(0xE0 + bit);
+      hidKb.pressRaw(k);
+      // If key was released by Core 0 while we were pressing, release it now
+      if (!typematicKey) {
+        hidKb.releaseRaw(k);
+        for (int bit = 0; bit < 8; bit++)
+          if (m & (1 << bit)) hidKb.releaseRaw(0xE0 + bit);
+      }
+    }
   }
 
   // ── Mouse movement → USB HID ─────────────────────────────────────────────

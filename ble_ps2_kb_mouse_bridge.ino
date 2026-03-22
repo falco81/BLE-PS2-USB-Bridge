@@ -31,7 +31,7 @@
  *   GND ----------- GND
  *   PS/2 +5V ------- VIN
  *
- * Serial commands (115200 baud, Serial.setTimeout = 20 ms):
+ * Serial commands (115200 baud):
  *   scan                  Scan BLE HID devices 10 s (shows KB / Mouse type)
  *   connect kb <mac>      Connect BLE keyboard and save to NVS
  *   connect mouse <mac>   Connect BLE mouse and save to NVS
@@ -56,7 +56,8 @@
  *     blocking loop() and delaying PS/2 Reset responses.
  *   - Packet queue is flushed on PS/2 Reset (0xFF) before sending BAT,
  *     preventing stale data from corrupting host driver state after reload.
- *   - Serial.setTimeout(20) prevents stray bytes from blocking loop().
+ *   - Serial input uses a non-blocking character accumulator — loop() is never
+ *     held waiting for input, so PS/2 timing is unaffected.
  */
 
 // Two simultaneous BLE clients need more NimBLE host stack than the default 4 kB.
@@ -71,6 +72,62 @@
 
 // LED pending update — set by PS/2 keyboard host task, consumed by loop()
 static volatile uint8_t pendingLedMask = 0xFF; // 0xFF = no pending update
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  LOCK-FREE LOG QUEUE  (Core 0 → Core 1)
+// ════════════════════════════════════════════════════════════════════════════════
+// HardwareSerial is not safe to call from multiple cores simultaneously.
+// All Serial output from Core 0 tasks must go through this queue.
+// loop() on Core 1 drains it every iteration via logDrain().
+//
+// Design constraints:
+//   • logQ() is called from ps2 host tasks while they hold the PS/2 mutex.
+//     vsnprintf() inside a mutex would delay the mutex and starve ps2send task.
+//   • Solution: store the raw message as a fixed string — logQ() only does
+//     a memcpy of an already-formatted string, which is ~10 ns.
+//   • Callers pre-format with snprintf into a local buffer, then call logQ().
+//   • For simple string literals, logQ_str() copies directly.
+//
+// Single-producer / single-consumer ring buffer — no mutex needed.
+// If the queue is full the message is silently dropped (non-blocking).
+
+#define LOG_QUEUE_SIZE  32
+#define LOG_MSG_LEN     80
+
+static char     _logBuf[LOG_QUEUE_SIZE][LOG_MSG_LEN];
+static volatile uint32_t _logHead = 0;  // written by Core 0
+static volatile uint32_t _logTail = 0;  // read    by Core 1
+
+// Enqueue a pre-formatted C string. IRAM — safe from any task/ISR.
+static void IRAM_ATTR logQ_str(const char* s) {
+  uint32_t next = (_logHead + 1) % LOG_QUEUE_SIZE;
+  if (next == _logTail) return;           // full — drop
+  strncpy(_logBuf[_logHead], s, LOG_MSG_LEN - 1);
+  _logBuf[_logHead][LOG_MSG_LEN - 1] = '\0';
+  _logHead = next;                        // publish atomically
+}
+
+// Convenience wrapper — formats into a local stack buffer, then enqueues.
+// Do NOT call while holding a FreeRTOS mutex (snprintf can be slow).
+// For calls inside reply_to_host() use logQ_str() with a pre-built string.
+static void logQ(const char* fmt, ...) {
+  char tmp[LOG_MSG_LEN];
+  va_list ap; va_start(ap, fmt); vsnprintf(tmp, LOG_MSG_LEN, fmt, ap); va_end(ap);
+  logQ_str(tmp);
+}
+
+// Drain from loop() (Core 1) only.
+// Non-blocking: prints only as many messages as fit in the UART TX buffer
+// without stalling. Remaining messages stay queued for the next loop() call.
+static void logDrain() {
+  while (_logTail != _logHead) {
+    const char* s = _logBuf[_logTail];
+    int len = strlen(s);
+    if (Serial.availableForWrite() < len) break; // TX buffer would block — defer
+    Serial.print(s);
+    _logTail = (_logTail + 1) % LOG_QUEUE_SIZE;
+  }
+}
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  PS/2 TIMING + COMMON LOW-LEVEL HELPERS
@@ -297,9 +354,13 @@ int PS2Keyboard::ps2_write(uint8_t data) {
 }
 
 int PS2Keyboard::ps2_write_wait_idle(uint8_t data, uint64_t timeout_us) {
+  // Yield to IDLE task every ~1 ms so the watchdog is fed.
+  // Pure busy-spin at priority 15 on Core 0 starves IDLE0 → watchdog crash.
+  // 1 ms yield is fine: clock-inhibit periods are in the ms range, not µs.
   uint64_t start = ps2_micros();
   while (get_bus_state() != BusState::IDLE) {
     if (ps2_micros() - start > timeout_us) return -1;
+    vTaskDelay(1); // yield for 1 tick (~1 ms) — feeds watchdog, allows IDLE0
   }
   return ps2_write(data);
 }
@@ -354,7 +415,8 @@ void PS2Keyboard::_ack() {
 
 void PS2Keyboard::reply_to_host(uint8_t cmd) {
   uint8_t val;
-  Serial.printf("[PS2KB] cmd 0x%02X\n", cmd);
+  // Per-command logging removed — floods logQ at hundreds of entries/s
+  // when host actively polls. Only important events (LED, Reset) are logged below.
   switch (cmd) {
     case 0xFF:
       _data_reporting = false;
@@ -399,7 +461,7 @@ void PS2Keyboard::reply_to_host(uint8_t cmd) {
         ps2_delay_us(PS2_BYTE_INTERVAL_US);
         // PS/2 LED bits: 0=ScrollLock 1=NumLock 2=CapsLock
         // BLE HID LED bits: 0=NumLock  1=CapsLock  2=ScrollLock
-        Serial.printf("[PS2KB] LED mask 0x%02X\n", val);
+        { char _t[40]; snprintf(_t,40,"[PS2KB] LED mask 0x%02X\n",val); logQ_str(_t); }
         uint8_t bleLed = 0;
         if (val & 0x02) bleLed |= 0x01;
         if (val & 0x04) bleLed |= 0x02;
@@ -427,8 +489,13 @@ void PS2Keyboard::begin() {
   vTaskDelay(pdMS_TO_TICKS(200));
   ps2_write(0xAA);
   xSemaphoreGive(_mutex);
-  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2kbhost", 4096, this,  8, &_task_host, 0);  // Core 0, pri 8 — host cmds are rare
-  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2kbsend", 4096, this, 15, &_task_send, 1);  // Core 1, pri 15 — scan codes must not jitter
+  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2kbhost", 4096, this,  8, &_task_host, 0);  // Core 0, pri 8
+  // Send task on Core 0, NOT Core 1.
+  // ps2_write() uses taskENTER_CRITICAL which masks interrupts on the running core.
+  // UART RX interrupts (Serial) run on Core 1 — moving send task to Core 0 means
+  // PS/2 byte transmission never masks UART RX, so Serial console always works.
+  // Priority 15 preempts BLE host stack (~pri 5) when a scan code needs sending.
+  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2kbsend", 4096, this, 15, &_task_send, 0);
   Serial.println("[PS2KB] begin() done — BAT sent");
 }
 
@@ -614,6 +681,7 @@ int PS2Mouse::ps2_write_wait_idle(uint8_t data, uint64_t timeout_us) {
   uint64_t start = ps2_micros();
   while (get_bus_state() != BusState::IDLE) {
     if (ps2_micros() - start > timeout_us) return -1;
+    vTaskDelay(1);
   }
   return ps2_write(data);
 }
@@ -662,7 +730,6 @@ int PS2Mouse::send_packet(PS2Packet *pkt) {
 // Supports IntelliMouse detection (magic sample-rate sequence 200→100→80).
 void PS2Mouse::reply_to_host(uint8_t cmd) {
   uint8_t val;
-  Serial.printf("[PS2MOUSE] cmd 0x%02X\n", cmd);
   switch (cmd) {
     case 0xFF: // Reset — disable reporting, send BAT + device ID
       _dataReporting = false;
@@ -726,13 +793,13 @@ void PS2Mouse::reply_to_host(uint8_t cmd) {
           _sampleHistory[0] == 200 && _sampleHistory[1] == 200 && _sampleHistory[2] == 80) {
         // Stage 2: IntelliMouse Explorer (5 buttons + scroll)
         _explorerMouse = true;
-        Serial.println("[PS2MOUSE] Explorer mode (ID=0x04) — Back/Forward + scroll");
+        logQ_str("[PS2MOUSE] Explorer mode (ID=0x04) — Back/Forward + scroll\n");
         while (ps2_write(0x04) != 0) vTaskDelay(1);
       } else if (g_ps2ProtoMode >= 0x03 && !_explorerMouse &&
                  _sampleHistory[0] == 200 && _sampleHistory[1] == 100 && _sampleHistory[2] == 80) {
         // Stage 1: IntelliMouse (scroll wheel, 3 buttons)
         _intelliMouse = true;
-        Serial.println("[PS2MOUSE] IntelliMouse mode (ID=0x03) — scroll wheel");
+        logQ_str("[PS2MOUSE] IntelliMouse mode (ID=0x03) — scroll wheel\n");
         while (ps2_write(0x03) != 0) vTaskDelay(1);
       } else {
         // No matching magic, or proto cap reached — return current ID
@@ -862,8 +929,10 @@ void PS2Mouse::begin() {
   ps2_write(0x00); // Device ID: standard mouse (IntelliMouse activates later via host command)
   xSemaphoreGive(_mutex);
 
-  xTaskCreatePinnedToCore(ps2mouse_task_host, "ps2mhost", 4096, this,  8, &_task_host, 0);  // Core 0, pri 8 — host cmds are rare
-  xTaskCreatePinnedToCore(ps2mouse_task_send, "ps2msend", 4096, this, 15, &_task_send, 1);  // Core 1, pri 15 — movement packets must not jitter
+  xTaskCreatePinnedToCore(ps2mouse_task_host, "ps2mhost", 4096, this,  8, &_task_host, 0);
+  // Core 0 — same reasoning as ps2kb_task_send: taskENTER_CRITICAL in ps2_write
+  // must not run on Core 1 where UART RX interrupts live.
+  xTaskCreatePinnedToCore(ps2mouse_task_send, "ps2msend", 4096, this, 15, &_task_send, 0);
   Serial.println("[PS2MOUSE] begin() done — BAT+ID sent");
 }
 
@@ -918,7 +987,7 @@ void ps2mouse_task_send(void *arg) {
 // ── Typematic ─────────────────────────────────────────────────────────────────
 #define TYPEMATIC_DELAY_MS 500
 #define TYPEMATIC_RATE_MS   50
-#define KEEPALIVE_MS       3000
+#define KEEPALIVE_MS      30000   // battery keepalive — every 30 s is enough
 
 // ── PS/2 device instances ─────────────────────────────────────────────────────
 static PS2Keyboard keyboard(PS2_KB_CLK_PIN, PS2_KB_DAT_PIN);
@@ -942,15 +1011,17 @@ static int           kbBattery          = -1;
 static unsigned long kbKeepaliveAt      = 0;
 static NimBLERemoteCharacteristic* pKbLedChar = nullptr;
 static NimBLERemoteCharacteristic* pKbBatChar = nullptr;
+static volatile bool kbConnecting       = false; // true while tryConnectKb() is running
 
 // Keyboard HID state
 static uint8_t prevKeys[6] = {0};
 static uint8_t prevMod     = 0;
 
 // Typematic
-static unsigned long typematicNext  = 0;
-static bool          typematicArmed = false;
-static uint8_t       typematicKey   = 0;
+// volatile — written by processHIDReport (Core 0 BLE callback), read by loop() (Core 1)
+static volatile unsigned long typematicNext  = 0;
+static volatile bool          typematicArmed = false;
+static volatile uint8_t       typematicKey   = 0;
 
 // Hotkey flags
 static volatile bool statusRequested  = false;
@@ -966,6 +1037,7 @@ static uint8_t       mouseType           = 1;
 static int           mouseBattery        = -1;
 static unsigned long mouseKeepaliveAt    = 0;
 static NimBLERemoteCharacteristic* pMouseBatChar = nullptr;
+static volatile bool mouseConnecting     = false; // true while tryConnectMouse() is running
 
 // Mouse settings (saved to NVS)
 static volatile int     g_scaleDivisor   = 4;
@@ -1007,9 +1079,6 @@ static bool isMouseHandle(uint16_t h) {
 }
 
 // Debug throttle
-static unsigned long g_lastMovePrint = 0;
-static int32_t  g_dbgX = 0, g_dbgY = 0, g_dbgW = 0;
-static uint32_t g_dbgPkts = 0;
 
 // ── Scan state ────────────────────────────────────────────────────────────────
 static int                  scanCount    = 0;
@@ -1071,8 +1140,8 @@ static void mouseNotifyCallback(NimBLERemoteCharacteristic* pChar,
 
   int16_t dx = 0, dy = 0; int8_t dw = 0; uint8_t btns = 0;
   if (!parseBLEMouseReport(pData, length, dx, dy, dw, btns)) {
-    Serial.printf("[MOUSE] unknown len=%d %02X %02X %02X %02X\n",
-      (int)length, pData[0], length>1?pData[1]:0, length>2?pData[2]:0, length>3?pData[3]:0);
+    // Unknown report format — silently ignore.
+    // No Serial here: callback runs on Core 0, Serial races with loop() on Core 1.
     return;
   }
   portENTER_CRITICAL(&g_mux);
@@ -1080,8 +1149,8 @@ static void mouseNotifyCallback(NimBLERemoteCharacteristic* pChar,
     g_accX += dx; g_accY += dy; g_accW += dw;
     g_buttons = btns; g_dirty = true;
   portEXIT_CRITICAL(&g_mux);
-  if (btns != prev)
-    Serial.printf("[BTN] L=%d R=%d M=%d\n", btns&1, (btns>>1)&1, (btns>>2)&1);
+  // Button change logging moved to processMouseMovement() which runs on Core 1
+  (void)prev;
 }
 
 // ── Mouse movement → PS/2 ────────────────────────────────────────────────────
@@ -1111,29 +1180,35 @@ void processMouseMovement() {
 
   if (sx == 0 && sy == 0 && sw == 0 && btns == g_prevButtons) return;
 
+  // Button change log — throttled, Core 1, non-blocking via logQ
+  if (btns != g_prevButtons)
+    logQ("[BTN] L=%d R=%d M=%d Bk=%d Fw=%d\n",
+      btns&1, (btns>>1)&1, (btns>>2)&1, (btns>>3)&1, (btns>>4)&1);
+
   g_prevButtons = btns;
 
   // Send movement in ±127 chunks (PS/2 mouse byte is int8_t)
+  int32_t totalX=0, totalY=0, totalW=0; uint32_t pkts=0;
   do {
     int8_t px = (int8_t)constrain(sx, -127, 127);
     int8_t py = (int8_t)constrain(sy, -127, 127);
     int8_t pw = (int8_t)constrain(sw, -127, 127);
-
     mouse.sendMovement(px, py, pw, btns);
-
-    g_dbgX += px; g_dbgY += py; g_dbgW += pw; g_dbgPkts++;
+    totalX+=px; totalY+=py; totalW+=pw; pkts++;
     sx -= px; sy -= py; sw -= pw;
     if (!sx && !sy && !sw) break;
   } while (sx || sy || sw);
 
-  // Throttled serial debug
+  // Throttled movement summary — max once per 500 ms
+  static unsigned long _lastMovePrint = 0;
+  static int32_t _sumX=0, _sumY=0, _sumW=0; static uint32_t _sumPkts=0;
+  _sumX+=totalX; _sumY+=totalY; _sumW+=totalW; _sumPkts+=pkts;
   unsigned long now = millis();
-  if (now - g_lastMovePrint >= 500 && g_dbgPkts > 0) {
-    Serial.printf("[MOUSE] pkts=%lu X=%d Y=%d W=%d btn=L%d R%d M%d Bk%d Fw%d\n",
-      g_dbgPkts, (int)g_dbgX, (int)g_dbgY, (int)g_dbgW,
+  if (now - _lastMovePrint >= 500 && _sumPkts > 0) {
+    logQ("[MOUSE] pkts=%lu X=%d Y=%d W=%d btn=L%d R%d M%d Bk%d Fw%d\n",
+      _sumPkts, (int)_sumX, (int)_sumY, (int)_sumW,
       btns&1, (btns>>1)&1, (btns>>2)&1, (btns>>3)&1, (btns>>4)&1);
-    g_dbgX = g_dbgY = g_dbgW = 0; g_dbgPkts = 0;
-    g_lastMovePrint = now;
+    _sumX=_sumY=_sumW=0; _sumPkts=0; _lastMovePrint=now;
   }
 }
 
@@ -1149,10 +1224,14 @@ void processHIDReport(uint8_t* data, size_t len) {
   size_t   nkeys = hasReserved ? len - 2  : len - 1;
   if (nkeys > 6) nkeys = 6;
 
-  // Raw HID dump — one line per report, enough for diagnostics without flooding Core 0
-  Serial.print("[KB] ");
-  for (size_t i = 0; i < len; i++) Serial.printf("%02X ", data[i]);
-  Serial.println();
+  // Raw HID dump — via logQ (Core 0 safe, non-blocking)
+  {
+    char _t[64]; int _n = snprintf(_t, sizeof(_t), "[KB]");
+    for (size_t i = 0; i < len && _n < 60; i++)
+      _n += snprintf(_t+_n, sizeof(_t)-_n, " %02X", data[i]);
+    snprintf(_t+_n, sizeof(_t)-_n, "\n");
+    logQ_str(_t);
+  }
 
   // Modifier keys
   for (int bit = 0; bit < 8; bit++) {
@@ -1223,12 +1302,12 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     std::string addr = dev->getAddress().toString();
     // Reconnect scans — check saved MACs
     if (kbReconnectScan && strlen(kbMAC) && addr == std::string(kbMAC)) {
-      Serial.println("[SCAN] Keyboard found — connecting...");
+      logQ("[SCAN] Keyboard found — connecting...\n");
       NimBLEDevice::getScan()->stop();
       kbReconnectScan = false; kbReconnectAt = millis() + 50;
     }
     if (mouseReconnectScan && strlen(mouseMAC) && addr == std::string(mouseMAC)) {
-      Serial.println("[SCAN] Mouse found — connecting...");
+      logQ("[SCAN] Mouse found — connecting...\n");
       NimBLEDevice::getScan()->stop();
       mouseReconnectScan = false; mouseReconnectAt = millis() + 50;
     }
@@ -1242,7 +1321,7 @@ class MyScanCallbacks : public NimBLEScanCallbacks {
     scanSeen.insert(addr);
     const char* app = dev->haveAppearance() ? bleAppName(dev->getAppearance()) : "HID";
     std::string nameStr = (dev->haveName() && dev->getName().length()) ? dev->getName() : "-";
-    Serial.printf("  #%-2d  %-17s  %-10s  %4d dBm  %s\n",
+    logQ("  #%-2d  %-17s  %-10s  %4d dBm  %s\n",
       scanCount+1, addr.c_str(), app, dev->getRSSI(), nameStr.c_str());
     scanCount++;
   }
@@ -1291,7 +1370,9 @@ bool tryConnectKb(NimBLEAddress addr) {
   if (bs) {
     NimBLERemoteCharacteristic* bc = bs->getCharacteristic(BAT_LVL_UUID);
     if (bc) {
-      if (bc->canRead()) { std::string v=bc->readValue(); if(!v.empty()) kbBattery=(int)(uint8_t)v[0]; pKbBatChar=bc; }
+      if (bc->canRead()) { NimBLEAttValue v=bc->readValue(); if(v.size()>0) kbBattery=(int)(uint8_t)v[0]; pKbBatChar=bc; }
+      // Subscribe: device pushes the actual current battery shortly after subscribe,
+      // correcting any stale readValue() result from connect time.
       if (bc->canNotify()) bc->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) { if(l>0) kbBattery=(int)d[0]; });
     }
   }
@@ -1360,7 +1441,7 @@ bool tryConnectMouse(NimBLEAddress addr) {
   if (bs) {
     NimBLERemoteCharacteristic* bc = bs->getCharacteristic(BAT_LVL_UUID);
     if (bc) {
-      if (bc->canRead()) { std::string v=bc->readValue(); if(!v.empty()) mouseBattery=(int)(uint8_t)v[0]; pMouseBatChar=bc; }
+      if (bc->canRead()) { NimBLEAttValue v=bc->readValue(); if(v.size()>0) mouseBattery=(int)(uint8_t)v[0]; pMouseBatChar=bc; }
       if (bc->canNotify()) bc->subscribe(true, [](NimBLERemoteCharacteristic*, uint8_t* d, size_t l, bool) { if(l>0) mouseBattery=(int)d[0]; });
     }
   }
@@ -1541,10 +1622,36 @@ void printHelp() {
   Serial.println("========================================\n");
 }
 
+// ── Non-blocking serial line accumulator ─────────────────────────────────────
+// Reads all available bytes without blocking. Returns true and sets `line`
+// when a complete line is received (\n or \r or \r\n — all handled).
+// Called once per loop() iteration; never holds loop() for more than the time
+// it takes to drain whatever is already in the UART RX FIFO (~128 bytes).
+static String _serialBuf = "";
+
+static bool serialReadLine(String& line) {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      // Accept \r, \n, or \r\n as line terminator
+      _serialBuf.trim();
+      if (_serialBuf.length() > 0) {
+        line = _serialBuf;
+        _serialBuf = "";
+        return true;
+      }
+      // bare \r or \n with empty buffer — ignore (e.g. second byte of \r\n)
+    } else {
+      _serialBuf += c;
+    }
+  }
+  return false;
+}
+
 void handleSerial() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n'); line.trim();
-  if (!line.length()) return;
+  String line;
+  if (!serialReadLine(line)) return;
+  Serial.printf("> %s\n", line.c_str()); // echo — confirms ESP32 received the command
 
   if (line == "help" || line == "?") {
     printHelp();
@@ -1574,7 +1681,7 @@ void handleSerial() {
       ok = tryConnectKb(addr);
       if (!ok) {
         if (attempt >= 20) { Serial.println("[KB] Giving up. Try: connect kb <mac> again."); break; }
-        if (Serial.available()) { Serial.readStringUntil('\n'); Serial.println("[KB] Aborted."); break; }
+        if (Serial.available()) { while(Serial.available()) Serial.read(); _serialBuf=""; Serial.println("[KB] Aborted."); break; }
         delay(500);
       }
     }
@@ -1594,7 +1701,7 @@ void handleSerial() {
       ok = tryConnectMouse(addr);
       if (!ok) {
         if (attempt >= 20) { Serial.println("[MOUSE] Giving up. Try again."); mouseReconnectAt=millis()+10000; break; }
-        if (Serial.available()) { Serial.readStringUntil('\n'); Serial.println("[MOUSE] Aborted."); break; }
+        if (Serial.available()) { while(Serial.available()) Serial.read(); _serialBuf=""; Serial.println("[MOUSE] Aborted."); break; }
         delay(500);
       }
     }
@@ -1687,39 +1794,44 @@ void bleDaemonTask(void* arg) {
     // ── Battery keepalives — readValue() is blocking (200-600 ms BLE round-trip).
     // Running here on Core 0 FreeRTOS task keeps loop() on Core 1 non-blocking,
     // so PS/2 Reset handling and mouse movement are never delayed.
+    // forceRead=true is required — NimBLE caches the last value by default,
+    // which means readValue() without true always returns the value from connect time.
     if (kbKeepaliveAt && millis() >= kbKeepaliveAt && pKbBatChar && pClientKb && pClientKb->isConnected()) {
       kbKeepaliveAt = millis() + KEEPALIVE_MS;
-      std::string v = pKbBatChar->readValue();
-      if (!v.empty()) kbBattery = (int)(uint8_t)v[0];
+      // Read to keep keyboard awake — result discarded.
+      // Battery value is maintained by the notification callback which provides
+      // the correct current value. readValue() returns a stale cached value.
+      pKbBatChar->readValue();
     }
     if (mouseKeepaliveAt && millis() >= mouseKeepaliveAt && pMouseBatChar && pClientMouse && pClientMouse->isConnected()) {
       mouseKeepaliveAt = millis() + KEEPALIVE_MS;
-      std::string v = pMouseBatChar->readValue();
-      if (!v.empty()) mouseBattery = (int)(uint8_t)v[0];
+      pMouseBatChar->readValue(); // keepalive only — result discarded
     }
 
     // Keyboard
-    if (!isManualScan && strlen(kbMAC) && !(pClientKb && pClientKb->isConnected()) && !kbReconnectAt) {
-      Serial.println("[DAEMON] Keyboard lost — scheduling reconnect...");
+    if (!isManualScan && strlen(kbMAC) && !(pClientKb && pClientKb->isConnected())
+        && !kbReconnectAt && !kbConnecting) {
+      logQ("[DAEMON] Keyboard lost — scheduling reconnect...\n");
       memset(prevKeys,0,6); prevMod=0; typematicKey=0; typematicArmed=false;
       if (!kbReconnectScan && !mouseReconnectScan) {
         kbReconnectScan=true;
         NimBLEDevice::getScan()->start(3000, false);
-        Serial.println("[SCAN] Waiting for keyboard...");
+        logQ("[SCAN] Waiting for keyboard...\n");
       } else {
         kbReconnectAt = millis() + 2000;
       }
     }
 
     // Mouse
-    if (!isManualScan && strlen(mouseMAC) && !(pClientMouse && pClientMouse->isConnected()) && !mouseReconnectAt) {
-      Serial.println("[DAEMON] Mouse lost — scheduling reconnect...");
+    if (!isManualScan && strlen(mouseMAC) && !(pClientMouse && pClientMouse->isConnected())
+        && !mouseReconnectAt && !mouseConnecting) {
+      logQ("[DAEMON] Mouse lost — scheduling reconnect...\n");
       portENTER_CRITICAL(&g_mux); g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false; portEXIT_CRITICAL(&g_mux);
       g_prevButtons=0;
       if (!kbReconnectScan && !mouseReconnectScan) {
         mouseReconnectScan=true;
         NimBLEDevice::getScan()->start(3000, false);
-        Serial.println("[SCAN] Waiting for mouse...");
+        logQ("[SCAN] Waiting for mouse...\n");
       } else {
         mouseReconnectAt = millis() + 2000;
       }
@@ -1734,9 +1846,8 @@ void bleDaemonTask(void* arg) {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  // Limit readStringUntil() timeout — default 1000 ms would block loop() for
-  // a full second if a stray byte arrives without a trailing newline.
-  Serial.setTimeout(20);
+  // Serial.setTimeout not needed — handleSerial() uses a non-blocking
+  // character accumulator that never calls readStringUntil().
 
   esp_wifi_stop();
   esp_wifi_deinit();
@@ -1791,6 +1902,7 @@ void setup() {
 // ════════════════════════════════════════════════════════════════════════════════
 
 void loop() {
+  logDrain();      // print any messages queued by Core 0 tasks
   handleSerial();
 
   // ── Scan end ─────────────────────────────────────────────────────────────────
@@ -1820,32 +1932,41 @@ void loop() {
   }
 
   // ── Keyboard reconnect ────────────────────────────────────────────────────────
-  if (kbReconnectAt && millis() >= kbReconnectAt && strlen(kbMAC)) {
+  if (kbReconnectAt && millis() >= kbReconnectAt && strlen(kbMAC) && !kbConnecting) {
     kbReconnectAt = 0;
     if (!pClientKb || !pClientKb->isConnected()) {
       if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt=0; }
+      kbConnecting = true;
       if (tryConnectKb(NimBLEAddress(kbMAC, kbType))) {
         kbReconnectFails=0;
       } else {
-        Serial.printf("[KB] Connect failed (%dx)\n", ++kbReconnectFails);
+        ++kbReconnectFails;
+        Serial.printf("[KB] Connect failed (%dx)\n", kbReconnectFails);
         kbReconnectScan=true;
-        NimBLEDevice::getScan()->start(3000, false);
+        // Exponential-ish backoff: wait longer after repeated failures (max 10s)
+        unsigned long backoff = min(2000UL + (unsigned long)kbReconnectFails * 500UL, 10000UL);
+        kbReconnectAt = millis() + backoff;
       }
+      kbConnecting = false;
     }
   }
 
   // ── Mouse reconnect ───────────────────────────────────────────────────────────
-  if (mouseReconnectAt && millis() >= mouseReconnectAt && strlen(mouseMAC)) {
+  if (mouseReconnectAt && millis() >= mouseReconnectAt && strlen(mouseMAC) && !mouseConnecting) {
     mouseReconnectAt = 0;
     if (!pClientMouse || !pClientMouse->isConnected()) {
       if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt=0; }
+      mouseConnecting = true;
       if (tryConnectMouse(NimBLEAddress(mouseMAC, mouseType))) {
         mouseReconnectFails=0;
       } else {
-        Serial.printf("[MOUSE] Connect failed (%dx)\n", ++mouseReconnectFails);
+        ++mouseReconnectFails;
+        Serial.printf("[MOUSE] Connect failed (%dx)\n", mouseReconnectFails);
         mouseReconnectScan=true;
-        NimBLEDevice::getScan()->start(3000, false);
+        unsigned long backoff = min(2000UL + (unsigned long)mouseReconnectFails * 500UL, 10000UL);
+        mouseReconnectAt = millis() + backoff;
       }
+      mouseConnecting = false;
     }
   }
 

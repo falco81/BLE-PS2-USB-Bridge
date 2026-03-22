@@ -154,11 +154,11 @@ static unsigned long  keepaliveAt = 0;
 static unsigned long     scanEndAt  = 0;
 static int               scanCount  = 0;
 
-// Typematic stav
-static unsigned long     typematicNext  = 0;
-static bool              typematicArmed = false;
-static uint8_t           typematicKey   = 0;   // HID keycode of held key
-static uint8_t           typematicMod   = 0;   // modifiers at time of hold
+// Typematic — volatile: written by processHIDReport (Core 0 callback), read by loop() (Core 1)
+static volatile unsigned long typematicNext  = 0;
+static volatile bool          typematicArmed = false;
+static volatile uint8_t       typematicKey   = 0;
+static volatile uint8_t       typematicMod   = 0;
 
 // ── USB HID — key transmission ────────────────────────────────────────────────
 //
@@ -247,18 +247,8 @@ void processHIDReport(uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; i++) conPrintf("%02X ", data[i]);
   conPrint("\n");
 
-  // Modifiers — apply full bitmask at once
-  if (mod != prevMod) {
-    usbApplyModifiers(mod);
-    // Log
-    for (int bit = 0; bit < 8; bit++) {
-      uint8_t mask = 1 << bit;
-      bool was = (prevMod & mask) != 0;
-      bool is  = (mod     & mask) != 0;
-      if (is  && !was) conPrintf("[+] %s\n", modName(bit));
-      if (!is &&  was) conPrintf("[-] %s\n", modName(bit));
-    }
-  }
+  // Modifiers — always apply (not just on change) to handle reconnect/state drift
+  usbApplyModifiers(mod);
 
   // Released keys
   for (int i = 0; i < 6; i++) {
@@ -282,31 +272,29 @@ void processHIDReport(uint8_t* data, size_t len) {
     }
   }
 
-  prevMod = mod;
-  memset(prevKeys, 0, 6);
-  memcpy(prevKeys, keys, nkeys);
-
-  // Forward LED state to BLE keyboard on lock key press
-  // PC sends USB HID output reports but they are not easily interceptable
-  // in Arduino core, so we track lock key toggles ourselves.
+  // LED sync — checked BEFORE prevKeys is overwritten so wasDown reflects old state
   {
     static uint8_t bleLedMask = 0;
     uint8_t lockKeys[] = { 0x53, 0x39, 0x47 }; // NumLock, CapsLock, ScrollLock
-    uint8_t ledBits[]  = { 0x01, 0x02, 0x04 }; // BLE HID LED bits
+    uint8_t ledBits[]  = { 0x01, 0x02, 0x04 };
     for (int k = 0; k < 3; k++) {
       bool isDown  = false;
       bool wasDown = false;
       for (size_t i = 0; i < nkeys; i++) if (keys[i]     == lockKeys[k]) isDown  = true;
       for (int    i = 0; i < 6;     i++) if (prevKeys[i] == lockKeys[k]) wasDown = true;
-      if (isDown && !wasDown) {  // key just pressed
+      if (isDown && !wasDown) {
         bleLedMask ^= ledBits[k];
         if (pLedChar) {
           pLedChar->writeValue(&bleLedMask, 1, false);
-          Serial.printf("[LED] BLE LED mask 0x%02X\n", bleLedMask);
+          conPrintf("[LED] BLE LED mask 0x%02X\n", bleLedMask);
         }
       }
     }
   }
+
+  prevMod = mod;
+  memset(prevKeys, 0, 6);
+  memcpy(prevKeys, keys, nkeys);
 
   // Hotkey detection — Left modifiers only
   // LCtrl=bit0  LShift=bit1  LAlt=bit2  PrintScreen=0x46
@@ -766,12 +754,13 @@ void loop() {
     }
   }
 
-  // Keepalive — periodic battery read prevents keyboard from entering deep sleep
+  // Keepalive — read to prevent keyboard sleep, result discarded.
+  // Battery value is maintained by the notification callback.
+  // readValue() returns a stale cached value that would overwrite the correct one.
   if (keepaliveAt && millis() >= keepaliveAt && pBatChar &&
       pClient && pClient->isConnected()) {
     keepaliveAt = millis() + KEEPALIVE_MS;
-    std::string val = pBatChar->readValue();
-    if (!val.empty()) batteryLevel = (int)(uint8_t)val[0];
+    pBatChar->readValue();
   }
 
   // Battery type-out (LCtrl+LAlt+PrtSc)
@@ -798,11 +787,19 @@ void loop() {
     } else {
       typematicNext = millis() + TYPEMATIC_RATE_MS;
     }
-    // Re-assert modifiers for typematic repeat (prevMod already matches typematicMod)
-    for (int bit = 0; bit < 8; bit++) {
-      if (typematicMod & (1 << bit)) hidKb.pressRaw(0xE0 + bit);
+    uint8_t k = typematicKey; // snapshot — Core 0 may clear typematicKey any time
+    uint8_t m = typematicMod;
+    if (k) {
+      for (int bit = 0; bit < 8; bit++)
+        if (m & (1 << bit)) hidKb.pressRaw(0xE0 + bit);
+      hidKb.pressRaw(k);
+      // If key was released by Core 0 while we were pressing, release it now
+      if (!typematicKey) {
+        hidKb.releaseRaw(k);
+        for (int bit = 0; bit < 8; bit++)
+          if (m & (1 << bit)) hidKb.releaseRaw(0xE0 + bit);
+      }
     }
-    hidKb.pressRaw(typematicKey);
   }
 
   delay(5);

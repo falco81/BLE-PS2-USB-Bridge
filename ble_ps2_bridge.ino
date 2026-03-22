@@ -620,9 +620,10 @@ static int            scanCount = 0;
 // Same logic as reference project: 500 ms initial delay, then 20 keys/s
 #define TYPEMATIC_DELAY_MS  500
 #define TYPEMATIC_RATE_MS    50
-static unsigned long  typematicNext  = 0;
-static bool           typematicArmed = false;
-static uint8_t        typematicKey   = 0;
+// volatile — written by processHIDReport (Core 0 BLE callback), read by loop() (Core 1)
+static volatile unsigned long typematicNext  = 0;
+static volatile bool          typematicArmed = false;
+static volatile uint8_t       typematicKey   = 0;
 
 
 // ── Key name helper for debug output ─────────────────────────────────────────
@@ -1077,10 +1078,11 @@ void handleSerial() {
 void bleDaemonTask(void* arg) {
   while (true) {
     vTaskDelay(pdMS_TO_TICKS(3000)); // check every 3 s
-    // Keepalive battery read — off loop() so it never causes key lag
+    // Keepalive — read to prevent keyboard sleep, result discarded.
+    // Battery value is maintained by the notification callback which provides
+    // the correct current value. readValue() returns a stale cached value.
     if (pBatChar && pClient && pClient->isConnected()) {
-      std::string val = pBatChar->readValue();
-      if (!val.empty()) batteryLevel = (int)(uint8_t)val[0];
+      pBatChar->readValue();
     }
 
     if (strlen(savedMAC) == 0) continue;                     // no saved keyboard
