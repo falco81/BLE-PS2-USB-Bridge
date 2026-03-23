@@ -762,7 +762,7 @@ On every boot the firmware prints all stored NVS values before the help text:
 | Hardware | ESP32-WROOM-32 + level shifter | ESP32-S3 | ESP32-S3 | ESP32-WROOM-32 + 2× level shifter |
 | Output | AT DIN-5 / PS/2 | USB-C keyboard | USB-C keyboard + mouse | PS/2 keyboard + PS/2 mouse |
 | BLE devices | 1 (keyboard) | 1 (keyboard) | 2 (keyboard + mouse) | 2 (keyboard + mouse) |
-| Extra components | BSS138 level shifter | None | None | 2× BSS138 level shifter |
+| Extra components | BSS138 level shifter | None | None | BSS138 level shifter (1 module, 4-ch) |
 | Compatibility | Retro PC, industrial | Modern PC, Mac, Linux | Modern PC, Mac, Linux | Retro PC, Socket 7, AT |
 | Mouse support | ✗ | ✗ | ✅ 5 buttons + wheel (USB) | ✅ 5 buttons + wheel (PS/2) |
 | PS/2 protocol modes | KB only | — | — | Standard / IntelliMouse / Explorer |
@@ -796,11 +796,7 @@ BLE keyboard **and** BLE mouse → **two PS/2 ports** simultaneously. Designed f
 
 ## Block Diagram
 
-```
-BLE Keyboard ──(BLE 5.0)──┐
-                          ├──► ESP32-WROOM-32 ──► PS/2 keyboard port (GPIO19/18)
-BLE Mouse    ──(BLE 5.0)──┘                   ──► PS/2 mouse port    (GPIO16/17)
-```
+![Block diagram PS/2 combo](doc/block_diagram_ps2_combo.svg)
 
 ## Hardware
 
@@ -809,37 +805,31 @@ BLE Mouse    ──(BLE 5.0)──┘                   ──► PS/2 mouse por
 | Component | Quantity | Description |
 |-----------|----------|-------------|
 | ESP32-WROOM-32 (MH-ET LIVE MiniKit) | 1 | Main microcontroller |
-| BSS138 bidirectional level shifter | 2 | One per PS/2 port |
+| BSS138 bidirectional level shifter | 1 | Single 4-channel module for both PS/2 ports |
 | PS/2 Mini-DIN 6 socket (keyboard) | 1 | Keyboard port on PC |
 | PS/2 Mini-DIN 6 socket (mouse) | 1 | Mouse port on PC |
 
-### Wiring
+A standard BSS138 module has 4 bidirectional channels — exactly enough for keyboard CLK+DATA and mouse CLK+DATA. **One module covers both PS/2 ports.**
 
-Both ports use the same level-shifter wiring pattern. Each PS/2 port requires its own level shifter module.
+### Wiring Diagram
 
-#### Keyboard port
+![Wiring diagram PS/2 combo](doc/wiring_diagram_ps2_combo.svg)
 
-| ESP32 pin | Level shifter | PS/2 Mini-DIN 6 | Signal |
-|-----------|--------------|-----------------|--------|
-| 3V3 | LV | — | 3.3 V reference |
-| VIN (5 V) | HV | pin 4 | 5 V + power |
-| GND | GND | pin 3 | Ground |
-| GPIO19 | A1 → B1 | pin 5 | CLK |
-| GPIO18 | A2 → B2 | pin 1 | DATA |
+### Step-by-step connections
 
-#### Mouse port
+| ESP32 pin | Level shifter | PS/2 connector | Signal |
+|-----------|--------------|----------------|--------|
+| 3V3 | LV | — | 3.3 V reference for LV side |
+| VIN (5 V) | HV | KB pin 4 + Mouse pin 4 | 5 V reference for HV side + power |
+| GND | GND (both) | KB pin 3 + Mouse pin 3 | Common ground |
+| GPIO19 | A1 → B1 | KB pin 5 | Keyboard CLK |
+| GPIO18 | A2 → B2 | KB pin 1 | Keyboard DATA |
+| GPIO16 | A3 → B3 | Mouse pin 5 | Mouse CLK |
+| GPIO17 | A4 → B4 | Mouse pin 1 | Mouse DATA |
 
-| ESP32 pin | Level shifter | PS/2 Mini-DIN 6 | Signal |
-|-----------|--------------|-----------------|--------|
-| 3V3 | LV | — | 3.3 V reference |
-| VIN (5 V) | HV | pin 4 | 5 V + power |
-| GND | GND | pin 3 | Ground |
-| GPIO16 | A1 → B1 | pin 5 | CLK |
-| GPIO17 | A2 → B2 | pin 1 | DATA |
+> ⚠️ **Mini-DIN 6 pinout:** pin 1 = DATA, pin 3 = GND, pin 4 = +5 V, pin 5 = CLK. Verify with your PC motherboard manual — pin numbering differs between male and female connectors.
 
-> ⚠️ **Two separate level shifter modules are required** — one for the keyboard port, one for the mouse port. Do not share a single module between both PS/2 ports.
-
-> ⚠️ **Mini-DIN 6 pinout:** pin 1 = DATA, pin 3 = GND, pin 4 = +5 V, pin 5 = CLK. This matches the standard PS/2 mouse connector. Verify with your PC motherboard manual — pin numbering differs between male and female connectors.
+> 💡 **Open-drain GPIO:** The firmware configures all four signal pins as `GPIO_MODE_OUTPUT_OD`. Driving LOW pulls the line down; releasing to INPUT allows the pull-up to float it HIGH — as required by the PS/2 protocol.
 
 ## Features
 
