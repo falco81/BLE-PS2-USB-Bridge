@@ -1,0 +1,79 @@
+<svg viewBox="0 0 900 240" xmlns="http://www.w3.org/2000/svg" font-family="Arial, sans-serif" font-size="13">
+
+  <rect width="900" height="240" fill="#1e1e2e" rx="12"/>
+
+  <!-- BLE Keyboard block -->
+  <rect x="20" y="40" width="145" height="72" rx="8" fill="#2a2a4a" stroke="#4a9eff" stroke-width="2"/>
+  <text x="92" y="68" fill="#4a9eff" font-size="13" font-weight="bold" text-anchor="middle">BLE Keyboard</text>
+  <text x="92" y="86" fill="#aaa" font-size="11" text-anchor="middle">HID over BLE</text>
+  <text x="92" y="101" fill="#aaa" font-size="11" text-anchor="middle">(any device)</text>
+
+  <!-- BLE Mouse block -->
+  <rect x="20" y="130" width="145" height="72" rx="8" fill="#2a2a4a" stroke="#4a9eff" stroke-width="2"/>
+  <text x="92" y="158" fill="#4a9eff" font-size="13" font-weight="bold" text-anchor="middle">BLE Mouse</text>
+  <text x="92" y="176" fill="#aaa" font-size="11" text-anchor="middle">HID over BLE</text>
+  <text x="92" y="191" fill="#aaa" font-size="11" text-anchor="middle">(any device)</text>
+
+  <!-- BLE arrows -->
+  <line x1="165" y1="76" x2="230" y2="110" stroke="#4a9eff" stroke-width="2" marker-end="url(#arrB)"/>
+  <line x1="165" y1="166" x2="230" y2="132" stroke="#4a9eff" stroke-width="2" marker-end="url(#arrB)"/>
+  <text x="195" y="88" fill="#4a9eff" font-size="10" text-anchor="middle">BLE 5.0</text>
+  <text x="195" y="162" fill="#4a9eff" font-size="10" text-anchor="middle">BLE 5.0</text>
+
+  <!-- ESP32 block -->
+  <rect x="230" y="50" width="185" height="140" rx="8" fill="#1a3a1a" stroke="#78d878" stroke-width="2"/>
+  <text x="322" y="76" fill="#78d878" font-size="13" font-weight="bold" text-anchor="middle">ESP32-WROOM-32</text>
+  <text x="322" y="96" fill="#aaa" font-size="10" text-anchor="middle">NimBLE-Arduino 2.x</text>
+  <text x="322" y="114" fill="#aaa" font-size="10" text-anchor="middle">HID → PS/2 scan codes</text>
+  <text x="322" y="130" fill="#aaa" font-size="10" text-anchor="middle">HID → PS/2 mouse packets</text>
+  <text x="322" y="146" fill="#aaa" font-size="10" text-anchor="middle">FreeRTOS PS/2 tasks</text>
+  <text x="322" y="162" fill="#aaa" font-size="10" text-anchor="middle">GPIO open-drain</text>
+  <text x="322" y="178" fill="#aaa" font-size="10" text-anchor="middle">GPIO 19/18 · 16/17</text>
+
+  <!-- ESP32 → Level shifter arrow -->
+  <line x1="415" y1="120" x2="475" y2="120" stroke="#78d878" stroke-width="2" marker-end="url(#arrG)"/>
+  <text x="445" y="111" fill="#78d878" font-size="10" text-anchor="middle">3.3V</text>
+  <text x="445" y="133" fill="#78d878" font-size="10" text-anchor="middle">4 signals</text>
+
+  <!-- Level shifter block — single module, 4 channels -->
+  <rect x="475" y="60" width="155" height="120" rx="8" fill="#2a2a2a" stroke="#ffd700" stroke-width="2"/>
+  <text x="552" y="86" fill="#ffd700" font-size="12" font-weight="bold" text-anchor="middle">Level Shifter</text>
+  <text x="552" y="103" fill="#aaa" font-size="10" text-anchor="middle">BSS138 · 1 module</text>
+  <text x="552" y="119" fill="#aaa" font-size="10" text-anchor="middle">3.3V ↔ 5V</text>
+  <text x="552" y="135" fill="#ffd700" font-size="10" text-anchor="middle">A1/B1 — KB CLK</text>
+  <text x="552" y="150" fill="#ffd700" font-size="10" text-anchor="middle">A2/B2 — KB DATA</text>
+  <text x="552" y="165" fill="#ffd700" font-size="10" text-anchor="middle">A3/B3 — Mouse CLK</text>
+
+  <!-- Level shifter → PC arrows (split to two ports) -->
+  <line x1="630" y1="95" x2="680" y2="80" stroke="#ffd700" stroke-width="2" marker-end="url(#arrY)"/>
+  <line x1="630" y1="145" x2="680" y2="162" stroke="#ffd700" stroke-width="2" marker-end="url(#arrY)"/>
+  <text x="653" y="88" fill="#ffd700" font-size="10" text-anchor="middle">5V</text>
+  <text x="653" y="168" fill="#ffd700" font-size="10" text-anchor="middle">5V</text>
+
+  <!-- PC block with two PS/2 ports -->
+  <rect x="680" y="40" width="200" height="160" rx="8" fill="#2a2a4a" stroke="#cc88ff" stroke-width="2"/>
+  <text x="780" y="66" fill="#cc88ff" font-size="13" font-weight="bold" text-anchor="middle">PC</text>
+
+  <rect x="698" y="76" width="160" height="46" rx="5" fill="#1e1e3a" stroke="#cc88ff" stroke-width="1"/>
+  <text x="778" y="97" fill="#cc88ff" font-size="11" font-weight="bold" text-anchor="middle">PS/2 Keyboard port</text>
+  <text x="778" y="114" fill="#aaa" font-size="10" text-anchor="middle">Mini-DIN 6</text>
+
+  <rect x="698" y="134" width="160" height="46" rx="5" fill="#1e1e3a" stroke="#cc88ff" stroke-width="1"/>
+  <text x="778" y="155" fill="#cc88ff" font-size="11" font-weight="bold" text-anchor="middle">PS/2 Mouse port</text>
+  <text x="778" y="172" fill="#aaa" font-size="10" text-anchor="middle">Mini-DIN 6</text>
+
+  <!-- Arrow markers -->
+  <defs>
+    <marker id="arrB" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#4a9eff"/>
+    </marker>
+    <marker id="arrG" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#78d878"/>
+    </marker>
+    <marker id="arrY" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ffd700"/>
+    </marker>
+  </defs>
+
+  <text x="450" y="222" fill="#555" font-size="11" text-anchor="middle">One BSS138 level shifter module handles all 4 signals (CLK+DATA for keyboard and mouse)</text>
+</svg>
