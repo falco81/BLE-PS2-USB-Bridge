@@ -32,6 +32,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 - **Persistent connect** — `connect` retries up to 20 times with 500 ms gaps; press any key in Serial Monitor to abort
 - **No byte drops** — send task retries every byte until acknowledged; multi-byte sequences (E0 + scancode) are never left incomplete
 - **Game-safe timing** — 100 ms clock-inhibit tolerance covers slow IRQ1 handlers in DOS games (Tyrian, Duke 3D, etc.)
+- **Permanent power** — when powered from the PS/2 port the ESP32 stays on across PC reboots; the host task detects PC power-on by measuring clock-inhibit duration (≥ 2 s) and automatically re-sends BAT
 
 ---
 
@@ -234,6 +235,14 @@ When the keyboard disconnects, the firmware starts a BLE scan and waits for the 
 
 On boot the firmware calls `keyboard.begin()` as the very first action in `setup()` — before `Serial.begin()`, before WiFi deinit, before anything else. This ensures **BAT (Basic Assurance Test) `0xAA`** reaches the PC within ~200 ms of power-on. BIOS waits up to ~500 ms for this byte; the previous order (`Serial.begin` + `delay(200)` + WiFi deinit first) consumed ~400 ms before BAT was sent, causing rare `Keyboard error` failures on slow boots.
 
+The `ps2_write(0xAA)` call in `begin()` uses a retry loop — if the bus is INHIBITED at that moment (PC still initialising its 8042 controller), the byte is retried until the bus is IDLE.
+
+#### Permanent power — PC reboot detection
+
+When the ESP32 is powered permanently from the PS/2 port it does not reset when the PC reboots or cold-boots. Without special handling `keyboard.begin()` only runs once and the PC never receives BAT on subsequent boots.
+
+The host task monitors how long the bus stays INHIBITED. A powered-off PC holds CLK low for seconds; normal 8042 clock-inhibit (between bytes) lasts less than 100 ms. When INHIBITED lasts ≥ 2 s and the bus then returns to IDLE, the firmware treats this as a PC power-on event and re-sends BAT automatically — identical behaviour to a fresh ESP32 boot.
+
 ### Host command handling
 
 | Command | Response | Notes |
@@ -304,7 +313,7 @@ The send task runs on **Core 0 at priority 15**. This is deliberate: `ps2_write(
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| *Keyboard error or not present* | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` is the first call in `setup()`, BAT arrives ~200 ms after reset. If it still occurs, check level shifter wiring and 5 V on HV side |
+| *Keyboard error or not present* | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` is the first call in `setup()`, BAT uses retry loop, and host task re-sends BAT after PC power-on while ESP32 is running. If it still occurs, check level shifter wiring and 5 V on HV side |
 | BIOS OK but OS fails | Supervision timeout during POST | Already fixed — supervision = 32 s |
 | Keys not repeating | — | Typematic implemented in firmware |
 | Wrong keys | Wrong pin assignment | DIN-5: pin1=CLK, pin2=DATA. Mini-DIN 6: pin5=CLK, pin1=DATA |
@@ -847,6 +856,7 @@ A standard BSS138 module has 4 bidirectional channels — exactly enough for key
 - **Keepalive** — battery read runs in `bleDaemonTask`; never blocks PS/2 timing
 - **No byte drops** — send tasks retry every byte; multi-byte sequences never left incomplete; `vTaskDelay(1)` in wait loop feeds the task watchdog
 - **Game-safe timing** — 100 ms clock-inhibit tolerance; `ps2send` tasks on Core 0 at priority 15; UART RX on Core 1 is never masked during PS/2 transmission
+- **Permanent power** — host tasks detect PC power-on after ≥ 2 s clock-inhibit and re-send BAT (keyboard) and BAT + Device ID (mouse) automatically
 - **Serial console always works** — non-blocking character accumulator replaces `readStringUntil`; all Core 0 log output routed through a lock-free queue to Core 1
 - **LED sync** — NumLock / CapsLock / ScrollLock forwarded from PC to BLE keyboard
 - **Battery shortcut** — **LCtrl+LAlt+PrtSc** types both levels: `K: 80% M: 95%`
@@ -1089,8 +1099,8 @@ Both send tasks run on **Core 0 at priority 15**. `ps2_write()` uses `taskENTER_
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| PC shows keyboard error at POST | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` is the first call in `setup()`, BAT arrives ~200 ms after reset. If it still occurs, check level shifter wiring on keyboard port; 5 V on HV side |
-| Mouse not detected at boot | Mouse BAT/ID not received | `mouse.begin()` also called before Serial/WiFi init. Check level shifter wiring on mouse port |
+| PC shows keyboard error at POST | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` is the first call in `setup()`, BAT uses retry loop, host task re-sends BAT after PC power-on while ESP32 is running. Check level shifter wiring on keyboard port; 5 V on HV side |
+| Mouse not detected at boot | Mouse BAT/ID not received | Same fix — `mouse.begin()` called before Serial/WiFi init, retry loop, host task re-sends BAT+ID on PC power-on. Check level shifter wiring on mouse port |
 | Wrong key output | Wrong pin assignment | Verify GPIO19=CLK, GPIO18=DATA for keyboard |
 | Mouse cursor erratic | Scale too low | Try `scale 4` or `scale 8` |
 | Scroll direction reversed | — | Use `flipw` |
