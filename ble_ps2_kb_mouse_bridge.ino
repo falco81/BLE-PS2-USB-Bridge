@@ -198,6 +198,7 @@ public:
   // Flush pending packets — call from reply_to_host(0xFF) before sending BAT,
   // while mutex is held, so send task cannot dequeue stale data after reset.
   void flushQueue() { if (_queue) xQueueReset(_queue); }
+  void set_data_reporting(bool v) { _data_reporting = v; }
   SemaphoreHandle_t get_mutex()  { return _mutex; }
   QueueHandle_t     get_queue()  { return _queue; }
 private:
@@ -241,6 +242,7 @@ public:
   int  send_packet(PS2Packet *pkt);
   // Flush pending packets — call from reply_to_host(0xFF) before sending BAT.
   void flushQueue() { if (_queue) xQueueReset(_queue); }
+  void set_data_reporting_on() { _dataReporting = true; }
   SemaphoreHandle_t get_mutex() { return _mutex; }
   QueueHandle_t     get_queue() { return _queue; }
 
@@ -250,7 +252,7 @@ private:
   QueueHandle_t     _queue  = nullptr;
   TaskHandle_t      _task_host = nullptr;
   TaskHandle_t      _task_send = nullptr;
-  bool    _dataReporting = false;
+  bool    _dataReporting = true;  // HIDman default: reporting on after BAT
   bool    _intelliMouse  = false;  // ID=0x03: 4-byte packets + scroll wheel
   bool    _explorerMouse = false;  // ID=0x04: 4-byte packets + scroll + B4/B5 (Back/Forward)
   uint8_t _sampleHistory[3] = {0, 0, 0}; // last 3 Set Sample Rate values
@@ -487,7 +489,7 @@ void PS2Keyboard::begin() {
   xSemaphoreTake(_mutex, portMAX_DELAY);
   ps2_delay_us(PS2_BYTE_INTERVAL_US);
   vTaskDelay(pdMS_TO_TICKS(200));
-  ps2_write(0xAA);
+  while (ps2_write(0xAA) != 0) { vTaskDelay(1); }
   xSemaphoreGive(_mutex);
   xTaskCreatePinnedToCore(ps2kb_task_host, "ps2kbhost", 4096, this,  8, &_task_host, 0);  // Core 0, pri 8
   // Send task on Core 0, NOT Core 1.
@@ -594,9 +596,33 @@ void PS2Keyboard::keyHid_send(uint8_t hid, bool down) {
 
 void ps2kb_task_host(void *arg) {
   PS2Keyboard *kb = (PS2Keyboard *)arg;
+  // Detect PC power-on while ESP32 is already running.
+  // Normal clock inhibit (8042 ACK) lasts < 100 ms.
+  // PC powered off holds CLK low for seconds. Threshold = 2000 ms.
+  unsigned long inhibitedSince = 0;
   while (true) {
     xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
-    if (kb->get_bus_state() == PS2Keyboard::BusState::HOST_REQUEST_TO_SEND) {
+    PS2Keyboard::BusState curState = kb->get_bus_state();
+    if (curState == PS2Keyboard::BusState::INHIBITED) {
+      if (inhibitedSince == 0) inhibitedSince = millis();
+    } else {
+      if (inhibitedSince != 0 && (millis() - inhibitedSince) >= 2000
+          && curState == PS2Keyboard::BusState::IDLE) {
+        kb->set_data_reporting(false);
+        kb->flushQueue();
+        xSemaphoreGive(kb->get_mutex());
+        vTaskDelay(pdMS_TO_TICKS(300));
+        xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
+        while (kb->ps2_write(0xAA) != 0) {
+          xSemaphoreGive(kb->get_mutex());
+          vTaskDelay(1);
+          xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
+        }
+        kb->set_data_reporting(true);
+      }
+      inhibitedSince = 0;
+    }
+    if (curState == PS2Keyboard::BusState::HOST_REQUEST_TO_SEND) {
       uint8_t cmd;
       if (kb->ps2_read(&cmd) == 0) kb->reply_to_host(cmd);
     }
@@ -744,6 +770,9 @@ void PS2Mouse::reply_to_host(uint8_t cmd) {
       while (ps2_write(0xAA) != 0) vTaskDelay(1);
       ps2_delay_us(PS2_BYTE_INTERVAL_US);
       while (ps2_write(0x00) != 0) vTaskDelay(1); // Standard mouse ID
+      // Re-enable reporting after BAT+ID — matches HIDman Ps2MouseSetDefaults() behaviour.
+      // Drivers that do not send 0xF4 still get movement data.
+      _dataReporting = true;
       break;
 
     case 0xFE: // Resend
@@ -888,16 +917,18 @@ void PS2Mouse::sendMovement(int8_t dx, int8_t dy_hid, int8_t dw, uint8_t btns) {
 
   if (_explorerMouse) {
     // Byte 3: 4-bit signed wheel + B4 (Back) + B5 (Forward)
-    // Wheel clamped to -8..+7, encoded as lower nibble 2's complement
-    int8_t w4 = (int8_t)constrain((int)dw, -8, 7);
+    // Wheel negated — HIDman uses (-Z & 0b00001111)
+    // BLE wheel down = positive dw → negate before clamping
+    int8_t w4 = (int8_t)constrain((int)(-dw), -8, 7);
     uint8_t byte3 = (uint8_t)(w4 & 0x0F);         // bits 3:0 = wheel
     if (btns & 0x08) byte3 |= 0x10;               // bit4 = Back
     if (btns & 0x10) byte3 |= 0x20;               // bit5 = Forward
     pkt.data[3] = byte3;
     pkt.len = 4;
   } else if (_intelliMouse) {
-    // Byte 3: full int8 scroll wheel, no button bits
-    pkt.data[3] = (uint8_t)dw;
+    // Byte 3: full int8 scroll wheel, negated — HIDman uses (-Z & 0xFF)
+    // BLE wheel down = positive dw, PS/2 wheel down = negative → negate
+    pkt.data[3] = (uint8_t)(-dw);
     pkt.len = 4;
   } else {
     pkt.len = 3; // scroll and extra buttons silently dropped
@@ -923,9 +954,9 @@ void PS2Mouse::begin() {
   xSemaphoreTake(_mutex, portMAX_DELAY);
   ps2_delay_us(PS2_BYTE_INTERVAL_US);
   vTaskDelay(pdMS_TO_TICKS(200));
-  ps2_write(0xAA);
+  while (ps2_write(0xAA) != 0) { vTaskDelay(1); }
   ps2_delay_us(PS2_BYTE_INTERVAL_US * 2);
-  ps2_write(0x00); // Device ID: standard mouse (IntelliMouse activates later via host command)
+  while (ps2_write(0x00) != 0) { vTaskDelay(1); }
   xSemaphoreGive(_mutex);
 
   xTaskCreatePinnedToCore(ps2mouse_task_host, "ps2mhost", 4096, this,  8, &_task_host, 0);
@@ -936,9 +967,37 @@ void PS2Mouse::begin() {
 
 void ps2mouse_task_host(void *arg) {
   PS2Mouse *m = (PS2Mouse *)arg;
+  // Same PC power-on detection as ps2kb_task_host — 2 s threshold.
+  unsigned long inhibitedSince = 0;
   while (true) {
     xSemaphoreTake(m->get_mutex(), portMAX_DELAY);
-    if (m->get_bus_state() == PS2Mouse::BusState::HOST_REQUEST_TO_SEND) {
+    PS2Mouse::BusState curState = m->get_bus_state();
+    if (curState == PS2Mouse::BusState::INHIBITED) {
+      if (inhibitedSince == 0) inhibitedSince = millis();
+    } else {
+      if (inhibitedSince != 0 && (millis() - inhibitedSince) >= 2000
+          && curState == PS2Mouse::BusState::IDLE) {
+        m->flushQueue();
+        xSemaphoreGive(m->get_mutex());
+        vTaskDelay(pdMS_TO_TICKS(300));
+        xSemaphoreTake(m->get_mutex(), portMAX_DELAY);
+        while (m->ps2_write(0xAA) != 0) {
+          xSemaphoreGive(m->get_mutex());
+          vTaskDelay(1);
+          xSemaphoreTake(m->get_mutex(), portMAX_DELAY);
+        }
+        ps2_delay_us(PS2_BYTE_INTERVAL_US * 2);
+        while (m->ps2_write(0x00) != 0) {
+          xSemaphoreGive(m->get_mutex());
+          vTaskDelay(1);
+          xSemaphoreTake(m->get_mutex(), portMAX_DELAY);
+        }
+        // Re-enable reporting after power-on BAT+ID
+        m->set_data_reporting_on();
+      }
+      inhibitedSince = 0;
+    }
+    if (curState == PS2Mouse::BusState::HOST_REQUEST_TO_SEND) {
       uint8_t cmd;
       if (m->ps2_read(&cmd) == 0) m->reply_to_host(cmd);
     }
@@ -1341,8 +1400,8 @@ bool tryConnectKb(NimBLEAddress addr) {
   }
   Serial.printf("[KB] Connecting to %s ...\n", addr.toString().c_str());
   pClientKb = NimBLEDevice::createClient();
-  pClientKb->setConnectionParams(6, 6, 0, 3200);  // fixed 7.5 ms interval — lowest BLE latency
-  pClientKb->setConnectTimeout(12);
+  pClientKb->setConnectionParams(6, 6, 0, 3200);
+  pClientKb->setConnectTimeout(5);
   if (!pClientKb->connect(addr)) {
     NimBLEDevice::deleteClient(pClientKb); pClientKb = nullptr; return false;
   }
@@ -1391,8 +1450,8 @@ bool tryConnectMouse(NimBLEAddress addr) {
   }
   Serial.printf("[MOUSE] Connecting to %s ...\n", addr.toString().c_str());
   pClientMouse = NimBLEDevice::createClient();
-  pClientMouse->setConnectionParams(6, 6, 0, 3200);  // fixed 7.5 ms interval
-  pClientMouse->setConnectTimeout(12);
+  pClientMouse->setConnectionParams(6, 6, 0, 3200);
+  pClientMouse->setConnectTimeout(5);
   if (!pClientMouse->connect(addr)) {
     NimBLEDevice::deleteClient(pClientMouse); pClientMouse = nullptr; return false;
   }
@@ -1786,52 +1845,88 @@ void handleSerial() {
 // ════════════════════════════════════════════════════════════════════════════════
 
 void bleDaemonTask(void* arg) {
+  // Runs on Core 0, priority 2.
+  // PS/2 send tasks (priority 15) and host tasks (priority 8) run on Core 0
+  // and freely preempt this task during any blocking BLE call.
+  // Keepalive and connect are moved here so loop() on Core 1 never blocks —
+  // processMouseMovement() and typematic always run on time (Tyrian fix).
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    // ── Battery keepalives — readValue() is blocking (200-600 ms BLE round-trip).
-    // Running here on Core 0 FreeRTOS task keeps loop() on Core 1 non-blocking,
-    // so PS/2 Reset handling and mouse movement are never delayed.
-    // forceRead=true is required — NimBLE caches the last value by default,
-    // which means readValue() without true always returns the value from connect time.
-    if (kbKeepaliveAt && millis() >= kbKeepaliveAt && pKbBatChar && pClientKb && pClientKb->isConnected()) {
+    // ── Battery keepalives ─────────────────────────────────────────────────
+    if (kbKeepaliveAt && millis() >= kbKeepaliveAt && pKbBatChar
+        && pClientKb && pClientKb->isConnected()) {
       kbKeepaliveAt = millis() + KEEPALIVE_MS;
-      // Read to keep keyboard awake — result discarded.
-      // Battery value is maintained by the notification callback which provides
-      // the correct current value. readValue() returns a stale cached value.
-      pKbBatChar->readValue();
+      pKbBatChar->readValue(); // keepalive — result discarded
     }
-    if (mouseKeepaliveAt && millis() >= mouseKeepaliveAt && pMouseBatChar && pClientMouse && pClientMouse->isConnected()) {
+    if (mouseKeepaliveAt && millis() >= mouseKeepaliveAt && pMouseBatChar
+        && pClientMouse && pClientMouse->isConnected()) {
       mouseKeepaliveAt = millis() + KEEPALIVE_MS;
-      pMouseBatChar->readValue(); // keepalive only — result discarded
+      pMouseBatChar->readValue();
     }
 
-    // Keyboard
-    if (!isManualScan && strlen(kbMAC) && !(pClientKb && pClientKb->isConnected())
+    // ── Keyboard: detect loss → start scan ────────────────────────────────
+    if (!isManualScan && strlen(kbMAC)
+        && !(pClientKb && pClientKb->isConnected())
         && !kbReconnectAt && !kbConnecting) {
-      logQ("[DAEMON] Keyboard lost — scheduling reconnect...\n");
+      logQ("[DAEMON] Keyboard lost — scanning\n");
       memset(prevKeys,0,6); prevMod=0; typematicKey=0; typematicArmed=false;
       if (!kbReconnectScan && !mouseReconnectScan) {
-        kbReconnectScan=true;
+        kbReconnectScan = true;
         NimBLEDevice::getScan()->start(3000, false);
-        logQ("[SCAN] Waiting for keyboard...\n");
       } else {
         kbReconnectAt = millis() + 2000;
       }
     }
 
-    // Mouse
-    if (!isManualScan && strlen(mouseMAC) && !(pClientMouse && pClientMouse->isConnected())
+    // ── Mouse: detect loss → start scan ───────────────────────────────────
+    if (!isManualScan && strlen(mouseMAC)
+        && !(pClientMouse && pClientMouse->isConnected())
         && !mouseReconnectAt && !mouseConnecting) {
-      logQ("[DAEMON] Mouse lost — scheduling reconnect...\n");
-      portENTER_CRITICAL(&g_mux); g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false; portEXIT_CRITICAL(&g_mux);
-      g_prevButtons=0;
+      logQ("[DAEMON] Mouse lost — scanning\n");
+      portENTER_CRITICAL(&g_mux);
+        g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false;
+      portEXIT_CRITICAL(&g_mux);
+      g_prevButtons = 0;
       if (!kbReconnectScan && !mouseReconnectScan) {
-        mouseReconnectScan=true;
+        mouseReconnectScan = true;
         NimBLEDevice::getScan()->start(3000, false);
-        logQ("[SCAN] Waiting for mouse...\n");
       } else {
         mouseReconnectAt = millis() + 2000;
+      }
+    }
+
+    // ── Keyboard: connect when timer fires ────────────────────────────────
+    if (kbReconnectAt && millis() >= kbReconnectAt && strlen(kbMAC) && !kbConnecting) {
+      kbReconnectAt = 0;
+      if (!pClientKb || !pClientKb->isConnected()) {
+        if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt=0; }
+        kbConnecting = true;
+        if (tryConnectKb(NimBLEAddress(kbMAC, kbType))) {
+          kbReconnectFails = 0;
+        } else {
+          logQ("[KB] Connect failed (%d)\n", ++kbReconnectFails);
+          kbReconnectScan = true;
+          NimBLEDevice::getScan()->start(3000, false);
+        }
+        kbConnecting = false;
+      }
+    }
+
+    // ── Mouse: connect when timer fires ───────────────────────────────────
+    if (mouseReconnectAt && millis() >= mouseReconnectAt && strlen(mouseMAC) && !mouseConnecting) {
+      mouseReconnectAt = 0;
+      if (!pClientMouse || !pClientMouse->isConnected()) {
+        if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt=0; }
+        mouseConnecting = true;
+        if (tryConnectMouse(NimBLEAddress(mouseMAC, mouseType))) {
+          mouseReconnectFails = 0;
+        } else {
+          logQ("[MOUSE] Connect failed (%d)\n", ++mouseReconnectFails);
+          mouseReconnectScan = true;
+          NimBLEDevice::getScan()->start(3000, false);
+        }
+        mouseConnecting = false;
       }
     }
   }
@@ -1871,8 +1966,9 @@ void setup() {
   NimBLEDevice::getScan()->setInterval(50);
   NimBLEDevice::getScan()->setWindow(45);
 
-  // Daemon task — monitors both connections, triggers reconnect on loss
-  xTaskCreatePinnedToCore(bleDaemonTask, "ble_daemon", 8192, nullptr, 1, nullptr, 0);
+  // Daemon: Core 0, priority 2 — PS/2 tasks (pri 15/8) preempt it freely.
+  // loop() on Core 1 is never blocked by BLE connect or keepalive.
+  xTaskCreatePinnedToCore(bleDaemonTask, "ble_daemon", 8192, nullptr, 2, nullptr, 0);
 
   // Load saved devices and mouse settings from NVS
   loadSavedDevices();
@@ -1889,8 +1985,10 @@ void setup() {
   Serial.printf( "[NVS] PS/2 Proto:    %s\n",  ps2ProtoName(g_ps2ProtoMode));
   Serial.println("[NVS] ============================================");
 
-  if (strlen(kbMAC))    kbReconnectAt    = millis() + 500;
-  if (strlen(mouseMAC)) mouseReconnectAt = millis() + 800;
+  // Delay first BLE attempt to after the PS/2 BIOS init window (~1 s).
+  // ESP32 and PC may power on simultaneously from the same PS/2 5V rail.
+  if (strlen(kbMAC))    kbReconnectAt    = millis() + 1500;
+  if (strlen(mouseMAC)) mouseReconnectAt = millis() + 1700;
 
   printHelp();
 }
@@ -1900,10 +1998,10 @@ void setup() {
 // ════════════════════════════════════════════════════════════════════════════════
 
 void loop() {
-  logDrain();      // print any messages queued by Core 0 tasks
+  logDrain();
   handleSerial();
 
-  // ── Scan end ─────────────────────────────────────────────────────────────────
+  // ── Manual scan end ───────────────────────────────────────────────────────────
   if (scanEndAt && millis() >= scanEndAt) {
     scanEndAt = 0; isManualScan = false;
     NimBLEDevice::getScan()->stop();
@@ -1911,61 +2009,22 @@ void loop() {
   }
 
   // ── Keyboard disconnect ───────────────────────────────────────────────────────
-  if (pClientKb && !pClientKb->isConnected() && strlen(kbMAC) && !kbReconnectAt) {
+  if (pClientKb && !pClientKb->isConnected() && strlen(kbMAC) && !kbReconnectAt && !kbConnecting) {
     Serial.println("[KB] Disconnected.");
-    NimBLEDevice::deleteClient(pClientKb); pClientKb=nullptr;
-    memset(prevKeys,0,6); prevMod=0;
-    kbReconnectFails=0; kbReconnectScan=true;
+    NimBLEDevice::deleteClient(pClientKb); pClientKb = nullptr;
+    memset(prevKeys,0,6); prevMod=0; typematicKey=0; typematicArmed=false;
+    kbReconnectFails = 0; kbReconnectScan = true;
     NimBLEDevice::getScan()->start(3000, false);
   }
 
   // ── Mouse disconnect ──────────────────────────────────────────────────────────
-  if (pClientMouse && !pClientMouse->isConnected() && strlen(mouseMAC) && !mouseReconnectAt) {
+  if (pClientMouse && !pClientMouse->isConnected() && strlen(mouseMAC) && !mouseReconnectAt && !mouseConnecting) {
     Serial.println("[MOUSE] Disconnected.");
-    NimBLEDevice::deleteClient(pClientMouse); pClientMouse=nullptr;
+    NimBLEDevice::deleteClient(pClientMouse); pClientMouse = nullptr;
     portENTER_CRITICAL(&g_mux); g_accX=g_accY=g_accW=0; g_buttons=0; g_dirty=false; portEXIT_CRITICAL(&g_mux);
-    g_prevButtons=0;
-    mouseReconnectFails=0; mouseReconnectScan=true;
+    g_prevButtons = 0;
+    mouseReconnectFails = 0; mouseReconnectScan = true;
     NimBLEDevice::getScan()->start(3000, false);
-  }
-
-  // ── Keyboard reconnect ────────────────────────────────────────────────────────
-  if (kbReconnectAt && millis() >= kbReconnectAt && strlen(kbMAC) && !kbConnecting) {
-    kbReconnectAt = 0;
-    if (!pClientKb || !pClientKb->isConnected()) {
-      if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt=0; }
-      kbConnecting = true;
-      if (tryConnectKb(NimBLEAddress(kbMAC, kbType))) {
-        kbReconnectFails=0;
-      } else {
-        ++kbReconnectFails;
-        Serial.printf("[KB] Connect failed (%dx)\n", kbReconnectFails);
-        kbReconnectScan=true;
-        // Exponential-ish backoff: wait longer after repeated failures (max 10s)
-        unsigned long backoff = min(2000UL + (unsigned long)kbReconnectFails * 500UL, 10000UL);
-        kbReconnectAt = millis() + backoff;
-      }
-      kbConnecting = false;
-    }
-  }
-
-  // ── Mouse reconnect ───────────────────────────────────────────────────────────
-  if (mouseReconnectAt && millis() >= mouseReconnectAt && strlen(mouseMAC) && !mouseConnecting) {
-    mouseReconnectAt = 0;
-    if (!pClientMouse || !pClientMouse->isConnected()) {
-      if (scanEndAt) { NimBLEDevice::getScan()->stop(); scanEndAt=0; }
-      mouseConnecting = true;
-      if (tryConnectMouse(NimBLEAddress(mouseMAC, mouseType))) {
-        mouseReconnectFails=0;
-      } else {
-        ++mouseReconnectFails;
-        Serial.printf("[MOUSE] Connect failed (%dx)\n", mouseReconnectFails);
-        mouseReconnectScan=true;
-        unsigned long backoff = min(2000UL + (unsigned long)mouseReconnectFails * 500UL, 10000UL);
-        mouseReconnectAt = millis() + backoff;
-      }
-      mouseConnecting = false;
-    }
   }
 
   // ── Forward LED state to BLE keyboard ────────────────────────────────────────
@@ -1975,13 +2034,13 @@ void loop() {
     Serial.printf("[LED] BLE LED mask 0x%02X\n", led);
   }
 
-  // ── Hotkeys — type battery or status via PS/2 keyboard ───────────────────────
+  // ── Hotkeys ───────────────────────────────────────────────────────────────────
   if (batteryRequested) {
     batteryRequested = false;
     typematicKey=0; typematicNext=0;
-    keyboard.keyHid_send(0xE0, false); // LCtrl release
-    keyboard.keyHid_send(0xE2, false); // LAlt  release
-    keyboard.keyHid_send(0xE1, false); // LShift release
+    keyboard.keyHid_send(0xE0, false);
+    keyboard.keyHid_send(0xE2, false);
+    keyboard.keyHid_send(0xE1, false);
     delay(50);
     typeBatteryViaPS2();
   }
@@ -1995,7 +2054,7 @@ void loop() {
     typeStatusViaPS2();
   }
 
-  // ── Typematic key repeat ──────────────────────────────────────────────────────
+  // ── Typematic ─────────────────────────────────────────────────────────────────
   if (typematicKey && typematicNext && millis() >= typematicNext) {
     if (!typematicArmed) { typematicArmed=true; typematicNext=millis()+TYPEMATIC_RATE_MS; }
     else                 { typematicNext=millis()+TYPEMATIC_RATE_MS; }
