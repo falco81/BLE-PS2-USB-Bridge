@@ -18,7 +18,7 @@ Ideal for retro PCs, vintage hardware, industrial machines or any device with an
 - **PS/2 AT emulator** — full scan code set 2, open-drain bus, FreeRTOS tasks
 - **Typematic** — key repeat with 500 ms initial delay, 20 keys/s rate
 - **Scan-before-connect** — waits for keyboard to start advertising before attempting connection, eliminates blind retry loops
-- **Auto-reconnect** — BLE daemon task detects disconnection and reconnects automatically
+- **Auto-reconnect** — BLE daemon task (Core 0) detects disconnection, scans until device is seen advertising, then connects immediately; `loop()` on Core 1 is never blocked
 - **Battery level** — reads and displays keyboard battery percentage if supported
 - **BIOS compatible** — responds to all POST commands including `GET_DEVICE_ID` (0xF2 → `0xAB 0x83`)
 - **Serial console** — `scan` / `connect` / `forget` / `status` commands at 115200 baud
@@ -225,7 +225,9 @@ In the **USB variant**, the PC sends a USB HID Output Report directly. Since Ard
 
 ### Automatic reconnect
 
-When the keyboard disconnects, the firmware starts a BLE scan and waits for the keyboard to begin advertising, then connects immediately. This eliminates the repeated 12-second connection timeouts that occur when connecting to a device that has not yet started advertising.
+When the keyboard disconnects, `bleDaemonTask` sets `kbReconnectScan = true` and starts a continuous BLE scan (`duration = 0`). As soon as `onDiscovered` sees the keyboard advertising, it clears the scan flag and sets `kbReconnectAt = now + 50 ms`. The daemon fires within 100 ms and calls `tryConnectKb()` — a blocking call of up to 5 s, but running on Core 0 at priority 2 it is preempted by the PS/2 tasks at any moment. `loop()` on Core 1 is never stalled.
+
+On boot with a saved MAC, the firmware delays the first scan by **1.5 s**. This avoids running BLE scan concurrently with the PS/2 BIOS initialisation window — the BIOS sends `0xFF` Reset to keyboard and mouse within the first ~1 s of power-on. When the ESP32 and PC are powered from the same PS/2 rail they start simultaneously; the delay ensures the PS/2 BAT exchange completes cleanly before RF activity begins.
 
 ---
 
@@ -272,28 +274,31 @@ The heuristic is `len == 8 && data[1] == 0x00` → standard format; otherwise co
 ### FreeRTOS architecture
 
 ```
-Core 0                          Core 1
-──────────────────────          ──────────────────────────────
-BLE stack (NimBLE)              loop() (Arduino default)
-  └─ notifyCallback()             handleSerial() — non-blocking
-       └─ keyboard.keyHid_send()  typematic, LED forward
-            └─ xQueueSend()       UART RX interrupts live here
+Core 0                              Core 1
+──────────────────────────────      ──────────────────────────────
+BLE stack (NimBLE)                  loop() (Arduino default)
+  └─ notifyCallback()                 handleSerial() — non-blocking
+       └─ keyboard.keyHid_send()      typematic, LED forward
+            └─ xQueueSend()           UART RX interrupts live here
+                                      processMouseMovement() — always runs
 
-ps2send task  (priority 15)
+ps2send task  (priority 15, Core 0)
   xQueueReceive() → ps2_write()
   retry loop — never drops a byte
 
-ps2host task  (priority 8)
+ps2host task  (priority 8, Core 0)
   checks CLK/DATA every 2 ms
   → reply_to_host()
 
-bleDaemonTask (priority 1)
-  check every 1 s
+bleDaemonTask (priority 2, Core 0)
+  polls every 100 ms
   keepalive readValue() — result discarded
-  scan-before-connect if lost
+  scan-first reconnect: waits for device to advertise,
+    then connects (never blocks loop())
+  boot: delays scan 1.5 s to clear PS/2 BIOS init window
 ```
 
-The send task runs on **Core 0 at priority 15**. This is deliberate: `ps2_write()` uses `taskENTER_CRITICAL` which masks interrupts on the running core. Running on Core 0 means UART RX interrupts on Core 1 are never masked, so the serial console always works while PS/2 bytes are being transmitted. The host task also runs on Core 0; host commands (LED, Reset) are rare and latency-tolerant.
+The send task runs on **Core 0 at priority 15**. `ps2_write()` uses `taskENTER_CRITICAL` which masks interrupts on its core — running on Core 0 means UART RX interrupts on Core 1 are never affected. The BLE daemon also runs on Core 0 at priority 2; PS/2 tasks (pri 15 and 8) preempt it freely during any blocking BLE `connect()` or `readValue()` call. `loop()` on Core 1 is **never blocked by BLE operations**, which eliminates input-drop issues in tight-polling DOS games like Tyrian.
 
 ### Timing constants
 
@@ -851,12 +856,13 @@ A standard BSS138 module has 4 bidirectional channels — exactly enough for key
 - **Scroll wheel and Y-axis inversion** — `flipw` / `flipy`
 - **Report ID filter** — `reportid` for mice with multiple HID characteristics (e.g. Logitech MX Master)
 - **Logitech 12-bit packed format** — MX Master 2/3, G502, M650 supported natively
-- **Independent auto-reconnect** — each BLE device reconnects separately
+- **Independent auto-reconnect** — each BLE device reconnects separately; `bleDaemonTask` (Core 0, priority 2) handles all scan/connect so `loop()` on Core 1 is never blocked
 - **NVS storage** — both MACs and all mouse settings saved across reboots
 - **Keepalive** — battery read runs in `bleDaemonTask`; never blocks PS/2 timing
 - **No byte drops** — send tasks retry every byte; multi-byte sequences never left incomplete; `vTaskDelay(1)` in wait loop feeds the task watchdog
-- **Game-safe timing** — 100 ms clock-inhibit tolerance; `ps2send` tasks on Core 0 at priority 15; UART RX on Core 1 is never masked during PS/2 transmission
+- **Game-safe timing** — 100 ms clock-inhibit tolerance; `ps2send` tasks on Core 0 at priority 15; UART RX on Core 1 is never masked during PS/2 transmission; `loop()` never blocked by BLE → mouse input always delivered on time in tight-polling games (Tyrian, etc.)
 - **Permanent power** — host tasks detect PC power-on after ≥ 2 s clock-inhibit and re-send BAT (keyboard) and BAT + Device ID (mouse) automatically
+- **Boot race** — BLE connect delayed 1.5 s after startup; ESP32 and PC may power on simultaneously from the same PS/2 5V rail; delay ensures PS/2 BAT exchange completes before BLE scanning begins
 - **Serial console always works** — non-blocking character accumulator replaces `readStringUntil`; all Core 0 log output routed through a lock-free queue to Core 1
 - **LED sync** — NumLock / CapsLock / ScrollLock forwarded from PC to BLE keyboard
 - **Battery shortcut** — **LCtrl+LAlt+PrtSc** types both levels: `K: 80% M: 95%`
@@ -992,7 +998,7 @@ connect kb aa:bb:cc:dd:ee:ff
 connect mouse db:81:f4:bb:6b:70
 ```
 
-Each device is saved to NVS. On next boot both reconnect automatically — keyboard at ~500 ms, mouse at ~800 ms after boot.
+Each device is saved to NVS. On next boot both reconnect automatically — keyboard at ~1.5 s, mouse at ~1.7 s after boot (delayed to clear the PS/2 BIOS init window).
 
 ### Keyboard Shortcuts
 
@@ -1049,25 +1055,29 @@ Core 0                              Core 1
 BLE stack (NimBLE)                  loop() (Arduino default)
   ├─ kbNotifyCallback()               handleSerial() — non-blocking
   │    └─ processHIDReport()          typematic (volatile vars)
-  │         └─ keyboard.keyHid_send() processMouseMovement()
+  │         └─ keyboard.keyHid_send() processMouseMovement() — always runs
   │              └─ xQueueSend()      UART RX interrupts live here
   │
   └─ mouseNotifyCallback()          ps2kb_send  (priority 15, Core 0)
        └─ portENTER_CRITICAL          retry loop → ps2_write() KB
-            g_accX/Y/W += delta       vTaskDelay(1) in wait loop
-            g_buttons = btns
-                                    ps2mouse_send  (priority 15, Core 0)
-ps2kb_host   (priority 8, Core 0)    retry loop → ps2_write() Mouse
-  checks CLK/DATA every 2 ms
-  → reply_to_host() + flushQueue() ps2mouse_host  (priority 8, Core 0)
-                                    checks CLK/DATA every 2 ms
-bleDaemonTask (priority 1, Core 0)  → reply_to_host() + flushQueue()
-  check every 1 s
+            g_accX/Y/W += delta
+            g_buttons = btns        ps2mouse_send  (priority 15, Core 0)
+                                      retry loop → ps2_write() Mouse
+ps2kb_host   (priority 8, Core 0)
+  checks CLK/DATA every 2 ms       ps2mouse_host  (priority 8, Core 0)
+  → reply_to_host() + flushQueue()   checks CLK/DATA every 2 ms
+                                      → reply_to_host() + flushQueue()
+bleDaemonTask (priority 2, Core 0)
+  poll every 100 ms
   keepalive readValue() — discarded
-  scan-before-connect if lost
+  detect disconnect → start scan
+  tryConnect when device seen
+  (PS/2 tasks preempt at any time)
 ```
 
-Both send tasks run on **Core 0 at priority 15**. `ps2_write()` uses `taskENTER_CRITICAL` which masks interrupts on its core — by running on Core 0 the UART RX interrupts on Core 1 are never affected. All Core 0 Serial output is routed through a lock-free ring buffer; `loop()` on Core 1 drains it without blocking.
+Both PS/2 send tasks run on **Core 0 at priority 15**, host tasks at priority 8. `bleDaemonTask` runs at priority 2 on the same core — PS/2 tasks preempt it freely during any blocking `connect()` or `readValue()` call. `loop()` on Core 1 is **never blocked by BLE**, so `processMouseMovement()` and typematic always run on schedule. This eliminates the input-drop issue in tight-polling DOS games like Tyrian.
+
+All Core 0 log output is routed through a lock-free ring buffer; `loop()` on Core 1 drains it without blocking.
 
 ### Timing
 
@@ -1080,6 +1090,9 @@ Both send tasks run on **Core 0 at priority 15**. `ps2_write()` uses `taskENTER_
 | BLE connection interval | 7.5 ms fixed (min=max=6 units) |
 | Supervision timeout | 32 s |
 | Keepalive interval | 30 s — read to keep device awake; result discarded |
+| BLE connect timeout | 5 s — if device does not respond, fails quickly and rescans |
+| Boot BLE delay | 1.5 s KB / 1.7 s Mouse — clears PS/2 BIOS init window |
+| bleDaemonTask poll | 100 ms |
 
 ### NVS Keys
 
@@ -1099,18 +1112,20 @@ Both send tasks run on **Core 0 at priority 15**. `ps2_write()` uses `taskENTER_
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| PC shows keyboard error at POST | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` is the first call in `setup()`, BAT uses retry loop, host task re-sends BAT after PC power-on while ESP32 is running. Check level shifter wiring on keyboard port; 5 V on HV side |
-| Mouse not detected at boot | Mouse BAT/ID not received | Same fix — `mouse.begin()` called before Serial/WiFi init, retry loop, host task re-sends BAT+ID on PC power-on. Check level shifter wiring on mouse port |
+| PC shows keyboard error at POST | BAT not received within BIOS timeout | Fixed — `keyboard.begin()` first in `setup()`, BAT uses retry loop, host task re-sends BAT after PC power-on while ESP32 is running. Check level shifter wiring; 5 V on HV side |
+| Mouse not detected at boot | Mouse BAT/ID not received | Same fix — `mouse.begin()` before Serial/WiFi init, retry loop, host task re-sends BAT+ID on PC power-on |
+| Keyboard/mouse not found when PC reboots while ESP32 stays on | BAT/ID not re-sent after warm reboot | Fixed — host tasks measure clock-inhibit duration; ≥ 2 s means PC off/reset; BAT and BAT+ID sent automatically when bus returns IDLE |
+| BLE devices connect slowly on boot | BLE scan starting during PS/2 BIOS init window | Fixed — BLE connect delayed 1.5 s (KB) / 1.7 s (mouse); PS/2 exchange completes first |
+| Input lag / dropped inputs in Tyrian or tight-polling DOS games | BLE `connect()` or `readValue()` blocking `loop()` | Fixed — all blocking BLE calls run in `bleDaemonTask` (Core 0, pri 2); PS/2 tasks (pri 15/8) preempt freely; `loop()` (Core 1) never stalls |
 | Wrong key output | Wrong pin assignment | Verify GPIO19=CLK, GPIO18=DATA for keyboard |
 | Mouse cursor erratic | Scale too low | Try `scale 4` or `scale 8` |
-| Scroll direction reversed | — | Use `flipw` |
+| Scroll direction reversed | Device uses inverted wheel axis | Use `flipw` |
 | Mouse detected as wrong protocol | Driver doesn't support Explorer | Use `proto 3` or `proto 0` |
-| Stuck keys in DOS games | — | Fixed — retry loop and 100 ms timeout prevent byte drops; `vTaskDelay(1)` keeps watchdog fed |
-| Input lag in tight-polling games | — | Fixed — keepalive result discarded; send tasks on Core 0 do not affect Core 1 loop timing |
+| Stuck keys in DOS games | IRQ1 handler inhibits clock > old timeout | Fixed — 100 ms `vTaskDelay(1)` retry; no byte ever dropped |
 | Serial console stops after keyboard connects | PS/2 `taskENTER_CRITICAL` masked UART RX | Fixed — send tasks on Core 0; UART RX on Core 1 never masked |
-| Battery shows wrong value | BLE device returns stale cached value via `readValue()` | Fixed — battery value comes from BLE notification callback only |
-| Back / Forward not working | Driver / OS mapping | Buttons are forwarded as PS/2 Explorer byte3 bits 4–5; requires Explorer-aware driver |
-| Only one device reconnects | Both devices reconnect at staggered times by design | Normal — keyboard at ~500 ms, mouse at ~800 ms after boot |
+| Battery shows wrong value | Stale cached `readValue()` | Fixed — battery value from BLE notification callback only |
+| Back / Forward not working | Requires Explorer-aware driver | Buttons forwarded as Explorer byte3 bits 4–5 |
+| Only one device reconnects | Staggered by design | Normal — keyboard ~1.5 s, mouse ~1.7 s after boot |
 
 ---
 
