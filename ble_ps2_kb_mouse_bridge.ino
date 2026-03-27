@@ -486,18 +486,19 @@ void PS2Keyboard::begin() {
   _gohi(_clk); _gohi(_dat);
   _mutex = xSemaphoreCreateMutex();
   _queue = xQueueCreate(PS2_PACKET_QUEUE_LEN, sizeof(PS2Packet));
+
+  // Create host task before the settle delay so it can respond to
+  // any 0xFF Reset the BIOS sends during the settle window.
+  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2kbhost", 4096, this,  8, &_task_host, 0);
+  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2kbsend", 4096, this, 15, &_task_send, 0);
+
+  // Settle delay — mutex NOT held so host task can receive BIOS commands.
+  vTaskDelay(pdMS_TO_TICKS(200));
+
   xSemaphoreTake(_mutex, portMAX_DELAY);
   ps2_delay_us(PS2_BYTE_INTERVAL_US);
-  vTaskDelay(pdMS_TO_TICKS(200));
   while (ps2_write(0xAA) != 0) { vTaskDelay(1); }
   xSemaphoreGive(_mutex);
-  xTaskCreatePinnedToCore(ps2kb_task_host, "ps2kbhost", 4096, this,  8, &_task_host, 0);  // Core 0, pri 8
-  // Send task on Core 0, NOT Core 1.
-  // ps2_write() uses taskENTER_CRITICAL which masks interrupts on the running core.
-  // UART RX interrupts (Serial) run on Core 1 — moving send task to Core 0 means
-  // PS/2 byte transmission never masks UART RX, so Serial console always works.
-  // Priority 15 preempts BLE host stack (~pri 5) when a scan code needs sending.
-  xTaskCreatePinnedToCore(ps2kb_task_send, "ps2kbsend", 4096, this, 15, &_task_send, 0);
 }
 
 int PS2Keyboard::send_packet(PS2Packet *pkt) {
@@ -950,19 +951,27 @@ void PS2Mouse::begin() {
   _mutex = xSemaphoreCreateMutex();
   _queue = xQueueCreate(PS2_PACKET_QUEUE_LEN, sizeof(PS2Packet));
 
-  // Send BAT then Device ID (0x00 = standard mouse)
+  // Create host task FIRST — before the settle delay and before sending BAT.
+  // The BIOS sends 0xFF Reset to the mouse port very early in POST (~200–400 ms
+  // from power-on). If the host task does not exist yet it cannot ACK that 0xFF,
+  // the BIOS times out and reports "mouse not found" intermittently.
+  // With the task running and the mutex FREE during the settle delay, the host
+  // task polls every 2 ms and can receive and handle any 0xFF that arrives.
+  xTaskCreatePinnedToCore(ps2mouse_task_host, "ps2mhost", 4096, this,  8, &_task_host, 0);
+  xTaskCreatePinnedToCore(ps2mouse_task_send, "ps2msend", 4096, this, 15, &_task_send, 0);
+
+  // Settle delay with mutex FREE so host task can respond to commands.
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  // Send proactive BAT + Device ID for BIOSes that expect an unsolicited reset
+  // response rather than sending 0xFF explicitly. If the BIOS already sent 0xFF
+  // during the settle window and the host task already replied, this is ignored.
   xSemaphoreTake(_mutex, portMAX_DELAY);
   ps2_delay_us(PS2_BYTE_INTERVAL_US);
-  vTaskDelay(pdMS_TO_TICKS(200));
   while (ps2_write(0xAA) != 0) { vTaskDelay(1); }
   ps2_delay_us(PS2_BYTE_INTERVAL_US * 2);
   while (ps2_write(0x00) != 0) { vTaskDelay(1); }
   xSemaphoreGive(_mutex);
-
-  xTaskCreatePinnedToCore(ps2mouse_task_host, "ps2mhost", 4096, this,  8, &_task_host, 0);
-  // Core 0 — same reasoning as ps2kb_task_send: taskENTER_CRITICAL in ps2_write
-  // must not run on Core 1 where UART RX interrupts live.
-  xTaskCreatePinnedToCore(ps2mouse_task_send, "ps2msend", 4096, this, 15, &_task_send, 0);
 }
 
 void ps2mouse_task_host(void *arg) {
@@ -1013,12 +1022,21 @@ void ps2mouse_task_send(void *arg) {
     if (xQueueReceive(m->get_queue(), &pkt, portMAX_DELAY) == pdTRUE) {
       xSemaphoreTake(m->get_mutex(), portMAX_DELAY);
       ps2_delay_us(PS2_BYTE_INTERVAL_US);
-      for (int i = 0; i < pkt.len; i++) {
-        // Retry until sent — host may inhibit clock while reading previous byte.
+      bool aborted = false;
+      for (int i = 0; i < pkt.len && !aborted; i++) {
+        // Abort the whole packet if the host pulls DATA low to send a command.
+        // Without this, the send task would spin in ps2_write_wait_idle() for
+        // up to 100 ms per byte while holding the mutex, preventing the host
+        // task from reading the command — causing drivers to report "mouse not
+        // found" because the 0xFF Reset ACK never arrives in time.
         while (m->ps2_write_wait_idle(pkt.data[i]) != 0) {
+          if (m->get_bus_state() == PS2Mouse::BusState::HOST_REQUEST_TO_SEND) {
+            aborted = true;
+            break;
+          }
           ps2_delay_us(PS2_BYTE_INTERVAL_US);
         }
-        if (i < pkt.len - 1)
+        if (!aborted && i < pkt.len - 1)
           ps2_delay_us(PS2_BYTE_INTERVAL_US);
       }
       xSemaphoreGive(m->get_mutex());
