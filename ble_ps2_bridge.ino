@@ -76,6 +76,8 @@ public:
   int  send_packet(PS2Packet *pkt);
   SemaphoreHandle_t get_mutex()  { return _mutex; }
   QueueHandle_t     get_queue()  { return _queue; }
+  void set_data_reporting(bool v) { _data_reporting = v; }
+  void flushQueue() { if (_queue) xQueueReset(_queue); }
 
 private:
   int _clk, _dat;
@@ -385,11 +387,14 @@ void PS2Keyboard::begin() {
   _mutex = xSemaphoreCreateMutex();
   _queue = xQueueCreate(PS2KB_PACKET_QUEUE_LEN, sizeof(PS2Packet));
 
-  // Send BAT before starting tasks — BIOS expects it within ~500 ms of power-on
+  // Send BAT before starting tasks — BIOS expects it within ~500 ms of power-on.
+  // Use a retry loop: if the bus is INHIBITED (PC holding CLK low during its own
+  // init), ps2_write() returns -1 and the byte is silently lost. Without a retry
+  // the BIOS never receives 0xAA and reports "Keyboard not found".
   xSemaphoreTake(_mutex, portMAX_DELAY);
   ps2_delay_us(PS2KB_BYTE_INTERVAL_US);
   vTaskDelay(pdMS_TO_TICKS(200));
-  ps2_write(0xAA);
+  while (ps2_write(0xAA) != 0) { vTaskDelay(pdMS_TO_TICKS(1)); }
   xSemaphoreGive(_mutex);
 
   // Core 0 — same as reference project (BLE/Bluetooth also on core 0; that's fine,
@@ -513,9 +518,48 @@ void PS2Keyboard::keyHid_send(uint8_t hid, bool down) {
 
 void ps2kb_task_host(void *arg) {
   PS2Keyboard *kb = (PS2Keyboard *)arg;
+  // Detect PC power-on while ESP32 is already running.
+  //
+  // The 8042 also pulls CLK low (INHIBITED) briefly after receiving each byte
+  // from the keyboard — this is normal ACK behaviour and must NOT trigger BAT.
+  // We distinguish "PC off" from "8042 ACK" by measuring how long INHIBITED
+  // lasts: a real power-off holds CLK low for hundreds of ms to seconds; a
+  // byte-ACK holds it for < 1 ms.  Threshold = 500 ms.
+  PS2Keyboard::BusState prevState = kb->get_bus_state();
+  unsigned long inhibitedSince = 0;
+
   while (true) {
     xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
-    if (kb->get_bus_state() == PS2Keyboard::BusState::HOST_REQUEST_TO_SEND) {
+
+    PS2Keyboard::BusState curState = kb->get_bus_state();
+
+    // Track how long we have been continuously INHIBITED
+    if (curState == PS2Keyboard::BusState::INHIBITED) {
+      if (inhibitedSince == 0) inhibitedSince = millis();
+    } else {
+      // Bus is no longer INHIBITED — was it long enough to mean PC power-on?
+      if (prevState == PS2Keyboard::BusState::INHIBITED
+          && inhibitedSince != 0
+          && (millis() - inhibitedSince) >= 2000) {
+        // Long INHIBITED → IDLE: PC just powered on or came out of reset
+        kb->set_data_reporting(false);
+        kb->flushQueue();
+        xSemaphoreGive(kb->get_mutex());
+        vTaskDelay(pdMS_TO_TICKS(300)); // let 8042 settle
+        xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
+        while (kb->ps2_write(0xAA) != 0) {
+          xSemaphoreGive(kb->get_mutex());
+          vTaskDelay(pdMS_TO_TICKS(1));
+          xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
+        }
+        kb->set_data_reporting(true);
+      }
+      inhibitedSince = 0; // reset timer whenever bus is not INHIBITED
+    }
+
+    prevState = curState;
+
+    if (curState == PS2Keyboard::BusState::HOST_REQUEST_TO_SEND) {
       uint8_t cmd;
       if (kb->ps2_read(&cmd) == 0) {
         kb->reply_to_host(cmd);
