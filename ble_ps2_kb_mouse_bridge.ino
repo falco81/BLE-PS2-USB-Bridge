@@ -637,6 +637,14 @@ void ps2kb_task_send(void *arg) {
   while (true) {
     PS2Packet pkt;
     if (xQueueReceive(kb->get_queue(), &pkt, portMAX_DELAY) == pdTRUE) {
+      // If the host is trying to send a command, wait for it to finish before
+      // taking the mutex. Without this, a DOS/Win98 driver 0xFF Reset during
+      // boot could be blocked by an in-flight packet, causing "keyboard not found".
+      // We check BEFORE taking the mutex — once the packet transmission starts it
+      // must complete fully (multi-byte sequences like E0+scancode must not be split).
+      while (kb->get_bus_state() == PS2Keyboard::BusState::HOST_REQUEST_TO_SEND) {
+        vTaskDelay(pdMS_TO_TICKS(PS2_HOST_POLL_MS));
+      }
       xSemaphoreTake(kb->get_mutex(), portMAX_DELAY);
       ps2_delay_us(PS2_BYTE_INTERVAL_US);
       for (int i = 0; i < pkt.len; i++) {
